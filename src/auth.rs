@@ -43,7 +43,9 @@ pub struct Session {
     pub token_type: String,
 }
 
-fn default_token_type() -> String { "Bearer".to_string() }
+fn default_token_type() -> String {
+    "Bearer".to_string()
+}
 
 impl Session {
     pub fn is_expired(&self) -> bool {
@@ -102,19 +104,19 @@ pub fn refresh_token(refresh_token: &str) -> Result<Session> {
 
     #[cfg(target_os = "windows")]
     let form: &[(&str, &str)] = &[
-        ("client_id",      CLIENT_ID),
-        ("grant_type",     "refresh_token"),
-        ("refresh_token",  refresh_token),
-        ("scope",          "r_usr w_usr"),
+        ("client_id", CLIENT_ID),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("scope", "r_usr w_usr"),
     ];
 
     #[cfg(not(target_os = "windows"))]
     let form: &[(&str, &str)] = &[
-        ("client_id",      CLIENT_ID),
-        ("client_secret",  CLIENT_SECRET),
-        ("grant_type",     "refresh_token"),
-        ("refresh_token",  refresh_token),
-        ("scope",          "r_usr w_usr"),
+        ("client_id", CLIENT_ID),
+        ("client_secret", CLIENT_SECRET),
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("scope", "r_usr w_usr"),
     ];
 
     let resp = client
@@ -148,7 +150,10 @@ fn pkce_login() -> Result<Session> {
     let auth_url = format!(
         "{}/authorize?client_id={}&client_unique_key={}&code_challenge={}\
          &code_challenge_method=S256&redirect_uri={}&response_type=code&scope=r_usr+w_usr",
-        "https://login.tidal.com", CLIENT_ID, cuk, challenge,
+        "https://login.tidal.com",
+        CLIENT_ID,
+        cuk,
+        challenge,
         percent_encode(TIDAL_REDIRECT),
     );
 
@@ -159,8 +164,8 @@ fn pkce_login() -> Result<Session> {
 /// automatically after the user logs in, then restore the original handler.
 #[cfg(target_os = "windows")]
 fn pkce_login_windows(auth_url: String, verifier: String, cuk: String) -> Result<Session> {
-    let exe = std::env::current_exe()
-        .map_err(|e| anyhow!("Could not determine exe path: {}", e))?;
+    let exe =
+        std::env::current_exe().map_err(|e| anyhow!("Could not determine exe path: {}", e))?;
     let exe_str = exe.to_string_lossy();
     let handler_cmd = format!("\"{}\" --auth-callback \"%1\"", exe_str);
 
@@ -169,14 +174,41 @@ fn pkce_login_windows(auth_url: String, verifier: String, cuk: String) -> Result
 
     let reg_base = r"HKCU\Software\Classes\tidal";
     let _ = std::process::Command::new("reg")
-        .args(["add", reg_base, "/ve", "/t", "REG_SZ", "/d", "URL:tidal Protocol", "/f"])
+        .args([
+            "add",
+            reg_base,
+            "/ve",
+            "/t",
+            "REG_SZ",
+            "/d",
+            "URL:tidal Protocol",
+            "/f",
+        ])
         .output();
     let _ = std::process::Command::new("reg")
-        .args(["add", reg_base, "/v", "URL Protocol", "/t", "REG_SZ", "/d", "", "/f"])
+        .args([
+            "add",
+            reg_base,
+            "/v",
+            "URL Protocol",
+            "/t",
+            "REG_SZ",
+            "/d",
+            "",
+            "/f",
+        ])
         .output();
     let _ = std::process::Command::new("reg")
-        .args(["add", &format!(r"{}\shell\open\command", reg_base),
-               "/ve", "/t", "REG_SZ", "/d", &handler_cmd, "/f"])
+        .args([
+            "add",
+            &format!(r"{}\shell\open\command", reg_base),
+            "/ve",
+            "/t",
+            "REG_SZ",
+            "/d",
+            &handler_cmd,
+            "/f",
+        ])
         .output();
 
     open_browser(&auth_url);
@@ -218,13 +250,13 @@ fn exchange_code(code: &str, verifier: &str, cuk: &str, redirect_uri: &str) -> R
     let resp = client
         .post(format!("{}/token", AUTH_BASE))
         .form(&[
-            ("client_id",         CLIENT_ID),
+            ("client_id", CLIENT_ID),
             ("client_unique_key", cuk),
-            ("code",              code),
-            ("code_verifier",     verifier),
-            ("grant_type",        "authorization_code"),
-            ("redirect_uri",      redirect_uri),
-            ("scope",             "r_usr w_usr"),
+            ("code", code),
+            ("code_verifier", verifier),
+            ("grant_type", "authorization_code"),
+            ("redirect_uri", redirect_uri),
+            ("scope", "r_usr w_usr"),
         ])
         .send()?;
 
@@ -283,11 +315,11 @@ fn device_auth_flow() -> Result<Session> {
         let poll = client
             .post(format!("{}/token", AUTH_BASE))
             .form(&[
-                ("grant_type",    "urn:ietf:params:oauth:grant-type:device_code"),
-                ("device_code",   &device.device_code),
-                ("client_id",     CLIENT_ID),
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("device_code", &device.device_code),
+                ("client_id", CLIENT_ID),
                 ("client_secret", CLIENT_SECRET),
-                ("scope",         "r_usr w_usr w_sub"),
+                ("scope", "r_usr w_usr w_sub"),
             ])
             .send()?;
 
@@ -301,20 +333,22 @@ fn device_auth_flow() -> Result<Session> {
             }
             #[derive(Deserialize)]
             struct UserResp {
-                #[serde(rename = "userId")]  user_id: u64,
-                #[serde(rename = "countryCode")] country_code: String,
+                #[serde(rename = "userId")]
+                user_id: u64,
+                #[serde(rename = "countryCode")]
+                country_code: String,
             }
 
             let data: TokenResp = poll.json()?;
             let expiry = Utc::now() + chrono::Duration::seconds(data.expires_in as i64);
             println!("Login successful!");
             return Ok(Session {
-                access_token:  data.access_token,
+                access_token: data.access_token,
                 refresh_token: data.refresh_token,
-                expiry_time:   expiry.to_rfc3339(),
-                user_id:       data.user.user_id,
-                country_code:  data.user.country_code,
-                token_type:    "Bearer".to_string(),
+                expiry_time: expiry.to_rfc3339(),
+                user_id: data.user.user_id,
+                country_code: data.user.country_code,
+                token_type: "Bearer".to_string(),
             });
         }
 
@@ -339,20 +373,24 @@ struct TokenResp {
 
 #[derive(Deserialize)]
 struct UserResp {
-    #[serde(rename = "userId")]      user_id: u64,
-    #[serde(rename = "countryCode")] country_code: String,
+    #[serde(rename = "userId")]
+    user_id: u64,
+    #[serde(rename = "countryCode")]
+    country_code: String,
 }
 
 fn parse_token_response(data: TokenResp, fallback_refresh: &str) -> Result<Session> {
     let expiry = Utc::now() + chrono::Duration::seconds(data.expires_in as i64);
     Ok(Session {
-        access_token:  data.access_token,
-        refresh_token: data.refresh_token.filter(|s| !s.is_empty())
+        access_token: data.access_token,
+        refresh_token: data
+            .refresh_token
+            .filter(|s| !s.is_empty())
             .unwrap_or_else(|| fallback_refresh.to_string()),
-        expiry_time:   expiry.to_rfc3339(),
-        user_id:       data.user.as_ref().map(|u| u.user_id).unwrap_or(0),
-        country_code:  data.user.map(|u| u.country_code).unwrap_or_default(),
-        token_type:    data.token_type,
+        expiry_time: expiry.to_rfc3339(),
+        user_id: data.user.as_ref().map(|u| u.user_id).unwrap_or(0),
+        country_code: data.user.map(|u| u.country_code).unwrap_or_default(),
+        token_type: data.token_type,
     })
 }
 
@@ -365,16 +403,30 @@ pub fn new_uuid() -> String {
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-\
          {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        b[0],b[1],b[2],b[3], b[4],b[5], b[6],b[7],
-        b[8],b[9], b[10],b[11],b[12],b[13],b[14],b[15]
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5],
+        b[6],
+        b[7],
+        b[8],
+        b[9],
+        b[10],
+        b[11],
+        b[12],
+        b[13],
+        b[14],
+        b[15]
     )
 }
 
 #[cfg(target_os = "windows")]
 fn pkce_pair() -> (String, String) {
     use base64::Engine;
-    use sha2::{Digest, Sha256};
     use rand::RngCore;
+    use sha2::{Digest, Sha256};
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
@@ -388,8 +440,9 @@ fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for byte in s.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             b => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -399,7 +452,8 @@ fn percent_encode(s: &str) -> String {
 #[cfg(target_os = "windows")]
 fn extract_code_from_url(url: &str) -> Result<String> {
     let query = url.splitn(2, '?').nth(1).unwrap_or(url);
-    query.split('&')
+    query
+        .split('&')
         .find(|p| p.starts_with("code="))
         .and_then(|kv| kv.splitn(2, '=').nth(1))
         .map(|s| s.to_string())
@@ -409,7 +463,11 @@ fn extract_code_from_url(url: &str) -> Result<String> {
 fn open_browser(url: &str) {
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &format!("Start-Process '{}'", url.replace('\'', "''"))])
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("Start-Process '{}'", url.replace('\'', "''")),
+        ])
         .spawn();
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
