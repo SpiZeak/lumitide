@@ -351,15 +351,15 @@ fn refilter(
 fn spawn_paginated<T, F>(session: crate::auth::Session, fetch: F) -> mpsc::Receiver<Result<Vec<T>>>
 where
     T: Send + 'static,
-    F: Fn(&TidalClient, u64, u64) -> Result<(Vec<T>, u64)> + Send + 'static,
+    F: Fn(&mut TidalClient, u64, u64) -> Result<(Vec<T>, u64)> + Send + 'static,
 {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let client = TidalClient::new(session);
+        let mut client = TidalClient::new(session);
         let mut offset = 0u64;
         let limit = 100u64;
         loop {
-            match fetch(&client, offset, limit) {
+            match fetch(&mut client, offset, limit) {
                 Ok((items, total)) => {
                     let len = items.len() as u64;
                     if tx.send(Ok(items)).is_err() { break; }
@@ -757,14 +757,14 @@ fn download_album(client: &mut TidalClient, album: &crate::api::AlbumInfo, track
 
         match stream_url_res {
             Ok(url) => {
-                let mut resp = reqwest::blocking::Client::new().get(&url).send();
+                let mut resp = reqwest::blocking::Client::new().get(&url.url).send();
                 if let Ok(ref r) = resp {
                     if r.status().as_u16() == 401 || r.status().as_u16() == 403 {
                         if let Ok(new_session) = crate::auth::refresh_token(&client.session.refresh_token) {
                             client.session = new_session;
                             let _ = crate::auth::save_session(&client.session);
                             if let Ok(new_url) = client.stream_url(track.id) {
-                                resp = reqwest::blocking::Client::new().get(&new_url).send();
+                                resp = reqwest::blocking::Client::new().get(&new_url.url).send();
                             }
                         }
                     }

@@ -15,7 +15,7 @@ Stream audio from your Tidal account directly in the terminal, with album art, a
 
 ![Lumitide demo](assets/demo.gif)
 
-**Playback:** `→/n` next &nbsp;`←/p` prev &nbsp;`Space` pause &nbsp;`↑/+` vol up &nbsp;`↓/-` vol down &nbsp;`d` download &nbsp;`r` radio &nbsp;`?` controls &nbsp;`q/Esc` back
+**Playback:** `→/n` next &nbsp;`←/p` prev &nbsp;`Space` pause &nbsp;`↑/+` vol up &nbsp;`↓/-` vol down &nbsp;`a` add to playlist/favorites &nbsp;`d` download &nbsp;`r` radio &nbsp;`?` controls &nbsp;`q/Esc` back
 
 **Lists:** `↑↓` / `jk` navigate &nbsp;`Enter` play &nbsp;`d` queue for download &nbsp;`Esc/q` back
 
@@ -30,6 +30,7 @@ Stream audio from your Tidal account directly in the terminal, with album art, a
 - **Mix mode** — browse and play your curated Tidal mixes with animated track transitions
 - **Playlist mode** — browse and play your Tidal playlists
 - **Radio** — press `r` on any track to start a Tidal radio seeded from it
+- **Add to playlist / favorites** — press `a` while a track plays to like it or add it to one of your playlists, without interrupting playback
 - **Search** — find tracks by title or artist
 - **Local playback** — shuffle local FLAC, MP3, and M4A files with the same UI
 - **Download** — press `d` while a track is playing to save it to disk; or press `d` on any album, mix, playlist, or track in a list view to queue it for **background download** without interrupting playback or navigation
@@ -172,6 +173,7 @@ lumitide config                        # open the config file in your editor
 | `Space` | Pause / resume |
 | `↑` / `+` | Volume up |
 | `↓` / `-` | Volume down |
+| `a` | Add current track to a playlist or favorites (picker overlay; playback continues) |
 | `d` | Download current track to disk |
 | `r` | Start radio from current track |
 | `?` | Toggle controls overlay |

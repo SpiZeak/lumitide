@@ -97,14 +97,15 @@ fn download_track(entry: &QueueEntry, http: &reqwest::blocking::Client) {
         return;
     }
 
-    let client = TidalClient::new(entry.session.clone());
+    let mut client = TidalClient::new(entry.session.clone());
     let stream_info = match client.stream_url(entry.track.id) {
         Ok(s) => s,
         Err(_) => {
             // Token may have expired — try to refresh once
+            // (send() already retries internally, so this is a second chance)
             if let Ok(new_session) = crate::auth::refresh_token(&entry.session.refresh_token) {
                 let _ = crate::auth::save_session(&new_session);
-                let refreshed = TidalClient::new(new_session);
+                let mut refreshed = TidalClient::new(new_session);
                 match refreshed.stream_url(entry.track.id) {
                     Ok(s) => s,
                     Err(_) => return,

@@ -394,6 +394,8 @@ fn parse_token_response(data: TokenResp, fallback_refresh: &str) -> Result<Sessi
     })
 }
 
+/// Called from the Windows PKCE login and the (ignored) playback-probe test.
+#[cfg(any(test, target_os = "windows"))]
 pub fn new_uuid() -> String {
     use rand::RngCore;
     let mut b = [0u8; 16];
@@ -460,6 +462,7 @@ fn extract_code_from_url(url: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("Could not find 'code' parameter in URL: {}", url))
 }
 
+#[cfg(target_os = "windows")]
 fn open_browser(url: &str) {
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("powershell")

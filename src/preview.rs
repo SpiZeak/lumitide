@@ -28,7 +28,7 @@ use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
-use crate::api::{TidalClient, TrackInfo};
+use crate::api::{PlaylistInfo, TidalClient, TrackInfo};
 use crate::color_state::{self, ColorState};
 use crate::config;
 use crate::cover::{render_cover, render_placeholder, ART_CHARS};
@@ -453,27 +453,50 @@ pub fn run(
 ) -> Result<String> {
     // ── Terminal up before API calls so the transition stays on screen ────────
     let mut terminal = setup_terminal()?;
-    if let Some(dir) = direction {
-        let arrow_color = LAST_ARROW_COLOR.with(|c| c.get());
-        if let Some(early) = draw_transition(&mut terminal, dir, track_label.as_deref(), 10, 40, arrow_color) {
-            teardown_terminal(&mut terminal);
-            return Ok(early.to_string());
+
+    // Fire the API calls before the animation so their latency hides behind
+    // the frames instead of stacking on top of them. Each fetch thread gets a
+    // cloned client; a clone that hits 401 refreshes its own session copy,
+    // and the main client still self-heals on its next 401.
+    let mut meta_client = client.clone();
+    let mut stream_client = client.clone();
+    let mut early: Option<&'static str> = None;
+
+    let ((track_res, cover_bytes), stream_res) = match std::thread::scope(|scope| {
+        let track_handle = scope.spawn(move || {
+            let track = meta_client.track(track_id);
+            let cover = track.as_ref().ok()
+                .and_then(|t| t.album_cover.as_deref())
+                .and_then(|id| meta_client.fetch_cover(id, 320).ok());
+            (track, cover)
+        });
+        let stream_handle = scope.spawn(move || stream_client.stream_url(track_id));
+
+        if let Some(dir) = direction {
+            let arrow_color = LAST_ARROW_COLOR.with(|c| c.get());
+            early = draw_transition(&mut terminal, dir, track_label.as_deref(), 6, 25, arrow_color);
         }
+
+        (track_handle.join(), stream_handle.join())
+    }) {
+        (Ok(t), Ok(s)) => (t, s),
+        (Err(p), _) | (_, Err(p)) => std::panic::resume_unwind(p),
+    };
+
+    // Nav key during the animation — discard the in-flight fetches and skip.
+    if let Some(nav) = early {
+        teardown_terminal(&mut terminal);
+        return Ok(nav.to_string());
     }
 
-    // API calls — last animation frame stays frozen while these block
-    let track = match client.track(track_id) {
+    let track = match track_res {
         Ok(t) => t,
         Err(e) => { teardown_terminal(&mut terminal); return Err(e); }
     };
-    let stream_info = match client.stream_url(track_id) {
+    let stream_info = match stream_res {
         Ok(s) => s,
         Err(e) => { teardown_terminal(&mut terminal); return Err(e); }
     };
-
-    // Fetch cover
-    let cover_bytes = track.album_cover.as_deref()
-        .and_then(|id| client.fetch_cover(id, 320).ok());
 
     // Download to temp file in a background thread
     let tmp = match tempfile::Builder::new().suffix(".flac").tempfile() {
@@ -533,6 +556,7 @@ pub fn run(
         volume,
         false,
         already_saved,
+        Some(&mut *client),
     )?;
 
     download_done.store(true, Ordering::Relaxed); // signal dl thread to stop
@@ -569,6 +593,7 @@ pub fn run_local(
         volume,
         true,
         false,
+        None,
     )
 }
 
@@ -632,6 +657,99 @@ fn download_to_file(
     done.store(true, Ordering::Relaxed);
 }
 
+// ─── Add-to-favorites / playlist menu ─────────────────────────────────────────
+
+/// Two-level modal: `playlists == None` → root menu, `Some` → playlist picker.
+struct AddMenu {
+    playlists: Option<Vec<PlaylistInfo>>,
+    cursor: usize,
+    scroll: usize,
+}
+
+fn add_menu_len(menu: &AddMenu) -> usize {
+    menu.playlists.as_ref().map_or(2, |p| p.len())
+}
+
+fn flash_msg(msg: String, flash: &mut Option<(String, Instant)>) {
+    // API errors carry long JSON bodies — keep the info line readable
+    let short: String = if msg.chars().count() > 60 {
+        let mut s: String = msg.chars().take(60).collect();
+        s.push('…');
+        s
+    } else {
+        msg
+    };
+    *flash = Some((short, Instant::now() + Duration::from_secs(3)));
+}
+
+/// Handle a key press while the add-to menu is open. All keys are consumed by
+/// the menu (playback keys are ignored until it closes).
+fn add_menu_key(
+    menu: &mut Option<AddMenu>,
+    key: KeyCode,
+    client: &mut TidalClient,
+    track_id: u64,
+    flash: &mut Option<(String, Instant)>,
+) {
+    let Some(mut m) = menu.take() else { return };
+    let mut reopen = true;
+    match key {
+        KeyCode::Up | KeyCode::Char('k') => m.cursor = m.cursor.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            if m.cursor + 1 < add_menu_len(&m) { m.cursor += 1; }
+        }
+        KeyCode::Enter => {
+            match &m.playlists {
+                // Root: 0 = favorites, 1 = playlist picker
+                None if m.cursor == 0 => {
+                    match client.add_favorite_track(track_id) {
+                        Ok(()) => flash_msg("✓ Added to favorites".into(), flash),
+                        Err(e) => flash_msg(format!("✗ {e}"), flash),
+                    }
+                    reopen = false;
+                }
+                None => match client.playlists() {
+                    Ok(list) if list.is_empty() => {
+                        flash_msg("✗ No playlists yet".into(), flash);
+                        reopen = false;
+                    }
+                    Ok(list) => {
+                        m.playlists = Some(list);
+                        m.cursor = 0;
+                        m.scroll = 0;
+                    }
+                    Err(e) => {
+                        flash_msg(format!("✗ {e}"), flash);
+                        reopen = false;
+                    }
+                },
+                Some(list) => {
+                    let pl = &list[m.cursor.min(list.len() - 1)];
+                    match client.add_track_to_playlist(&pl.id, track_id) {
+                        Ok(true) => flash_msg(format!("✓ Added to {}", pl.title), flash),
+                        Ok(false) => flash_msg(format!("✓ Already in {}", pl.title), flash),
+                        Err(e) => flash_msg(format!("✗ {e}"), flash),
+                    }
+                    reopen = false;
+                }
+            }
+        }
+        KeyCode::Esc => {
+            if m.playlists.is_some() {
+                // Back out of the playlist picker to the root menu
+                m.playlists = None;
+                m.cursor = 1;
+                m.scroll = 0;
+            } else {
+                reopen = false;
+            }
+        }
+        KeyCode::Char('q') | KeyCode::Char('Q') => reopen = false,
+        _ => {}
+    }
+    if reopen { *menu = Some(m); }
+}
+
 // ─── Core playback + UI loop ──────────────────────────────────────────────────
 
 fn play(
@@ -647,6 +765,7 @@ fn play(
     volume: Arc<Mutex<f32>>,
     is_local: bool,
     already_saved: bool,
+    mut client: Option<&mut TidalClient>,
 ) -> Result<String> {
     let cfg = config::load();
 
@@ -908,6 +1027,8 @@ fn play(
     let mut beat_snap: Vec<f64> = Vec::new();
     let mut beat_idx: usize = 0;
     let band_edges = spectrum::compute_band_edges(sample_rate);
+    let mut add_menu: Option<AddMenu> = None;
+    let mut flash: Option<(String, Instant)> = None;
 
     let result_str = loop {
         let elapsed_secs = current_sample.load(Ordering::Relaxed) as f64 / sample_rate as f64;
@@ -959,6 +1080,35 @@ fn play(
 
         let vol = *volume.lock().unwrap_or_else(|e| e.into_inner());
         let queue_status = crate::DOWNLOAD_QUEUE.get().and_then(|q| q.status());
+
+        // Keep the menu cursor inside the visible window.
+        // Clamp by the rendered inner height (terminal height minus borders)
+        // so the selection can't scroll out of view on short terminals.
+        if let Some(m) = add_menu.as_mut() {
+            let term_h = terminal.size().map(|r| r.height as usize).unwrap_or(0);
+            let visible = panel::MENU_MAX_VISIBLE
+                .min(add_menu_len(m))
+                .min(term_h.saturating_sub(2))
+                .max(1);
+            if m.cursor < m.scroll { m.scroll = m.cursor; }
+            if m.cursor >= m.scroll + visible { m.scroll = m.cursor + 1 - visible; }
+        }
+        let root_items = vec!["♥ Add to favorites".to_string(), "≡ Add to playlist".to_string()];
+        let playlist_titles: Vec<String> = add_menu.as_ref()
+            .and_then(|m| m.playlists.as_ref())
+            .map(|list| list.iter().map(|p| p.title.clone()).collect())
+            .unwrap_or_default();
+        let menu_overlay = add_menu.as_ref().map(|m| {
+            let (title, items) = match &m.playlists {
+                Some(_) => ("Add to playlist", playlist_titles.as_slice()),
+                None => ("Add track", root_items.as_slice()),
+            };
+            panel::MenuOverlay { title, items, cursor: m.cursor, scroll: m.scroll }
+        });
+        let flash_text = flash.as_ref()
+            .filter(|(_, until)| Instant::now() < *until)
+            .map(|(msg, _)| msg.as_str());
+
         let panel_state = PanelState {
             cover_lines,
             track_name: &track.title,
@@ -970,12 +1120,14 @@ fn play(
             volume: vol,
             paused: paused.load(Ordering::Relaxed),
             dl_status: &dl_stat,
+            flash_msg: flash_text,
             bar_color,
             vis_lines: &vis,
             is_local,
             show_controls,
             show_controls_hint: cfg.show_controls_hint,
             queue_status,
+            menu: menu_overlay,
         };
 
         terminal.draw(|f| panel::render(f, &panel_state))?;
@@ -984,108 +1136,129 @@ fn play(
         if event::poll(Duration::from_millis(90))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
-                            stop_all.store(true, Ordering::Relaxed);
-                            break "quit".to_string();
+                    // The add-to menu is modal — it consumes every key while open
+                    let consumed = if add_menu.is_some() {
+                        if let Some(c) = client.as_deref_mut() {
+                            add_menu_key(&mut add_menu, key.code, c, track.id, &mut flash);
                         }
-                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Right => {
-                            stop_all.store(true, Ordering::Relaxed);
-                            break "next".to_string();
-                        }
-                        KeyCode::Char('p') | KeyCode::Left => {
-                            stop_all.store(true, Ordering::Relaxed);
-                            break "prev".to_string();
-                        }
-                        KeyCode::Char('r') | KeyCode::Char('R') => {
-                            stop_all.store(true, Ordering::Relaxed);
-                            break format!("radio:{}", track.id);
-                        }
-                        KeyCode::Char(' ') => {
-                            let p = paused.load(Ordering::Relaxed);
-                            paused.store(!p, Ordering::Relaxed);
-                            if let Some(ref mut mc) = media_controls {
-                                let _ = mc.set_playback(if p {
-                                    souvlaki::MediaPlayback::Playing { progress: None }
-                                } else {
-                                    souvlaki::MediaPlayback::Paused { progress: None }
-                                });
+                        true
+                    } else {
+                        false
+                    };
+                    if !consumed {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+                                stop_all.store(true, Ordering::Relaxed);
+                                break "quit".to_string();
                             }
-                        }
-                        KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => {
-                            {
-                                let mut v = volume.lock().unwrap_or_else(|e| e.into_inner());
-                                *v = vol_up(*v);
+                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Right => {
+                                stop_all.store(true, Ordering::Relaxed);
+                                break "next".to_string();
                             }
-                            let _ = config::save_volume(*volume.lock().unwrap_or_else(|e| e.into_inner()));
-                        }
-                        KeyCode::Down | KeyCode::Char('-') => {
-                            {
-                                let mut v = volume.lock().unwrap_or_else(|e| e.into_inner());
-                                *v = vol_down(*v);
+                            KeyCode::Char('p') | KeyCode::Left => {
+                                stop_all.store(true, Ordering::Relaxed);
+                                break "prev".to_string();
                             }
-                            let _ = config::save_volume(*volume.lock().unwrap_or_else(|e| e.into_inner()));
-                        }
-                        KeyCode::Char('?') => {
-                            show_controls = !show_controls;
-                        }
-                        KeyCode::Char('d') | KeyCode::Char('D') => {
-                            if already_saved || is_local {
-                                *dl_flash_until.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + Duration::from_secs(2));
-                            } else {
-                                let mut stat = dl_status.lock().unwrap_or_else(|e| e.into_inner());
-                                if stat.is_empty() {
-                                    let already_buffered = download_done.load(Ordering::Relaxed);
-                                    if already_buffered {
-                                        // Streaming done — copy is instant, no bar needed.
-                                        // Show status in the info line only.
-                                        *stat = "✓ Saving...".to_string();
-                                        drop(stat);
-                                        let temp_path = path.to_path_buf();
-                                        let track_clone = track.clone();
-                                        let cover_owned: Option<Vec<u8>> = cover_bytes.map(|b| b.to_vec());
-                                        let out_dir = cfg.output_path();
-                                        let dl_status2 = dl_status.clone();
-                                        let dummy = Arc::new(AtomicU64::new(0));
-                                        thread::spawn(move || {
-                                            match save_streamed_track(
-                                                &temp_path, &track_clone,
-                                                cover_owned.as_deref(), &out_dir, &dummy,
-                                            ) {
-                                                Ok(_) => *dl_status2.lock().unwrap_or_else(|e| e.into_inner()) = "✓ Saved".to_string(),
-                                                Err(e) => *dl_status2.lock().unwrap_or_else(|e| e.into_inner()) = format!("✗ {e}"),
-                                            }
-                                        });
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                stop_all.store(true, Ordering::Relaxed);
+                                break format!("radio:{}", track.id);
+                            }
+                            KeyCode::Char(' ') => {
+                                let p = paused.load(Ordering::Relaxed);
+                                paused.store(!p, Ordering::Relaxed);
+                                if let Some(ref mut mc) = media_controls {
+                                    let _ = mc.set_playback(if p {
+                                        souvlaki::MediaPlayback::Playing { progress: None }
                                     } else {
-                                        // Still buffering — show the real streaming
-                                        // progress bar (dl_bytes/dl_total already animating).
-                                        *stat = "⬇ Downloading...".to_string();
-                                        drop(stat);
-                                        let temp_path = path.to_path_buf();
-                                        let track_clone = track.clone();
-                                        let cover_owned: Option<Vec<u8>> = cover_bytes.map(|b| b.to_vec());
-                                        let dl_done = download_done.clone();
-                                        let out_dir = cfg.output_path();
-                                        let dl_status2 = dl_status.clone();
-                                        let dummy = Arc::new(AtomicU64::new(0));
-                                        thread::spawn(move || {
-                                            while !dl_done.load(Ordering::Relaxed) {
-                                                thread::sleep(Duration::from_millis(200));
-                                            }
-                                            match save_streamed_track(
-                                                &temp_path, &track_clone,
-                                                cover_owned.as_deref(), &out_dir, &dummy,
-                                            ) {
-                                                Ok(_) => *dl_status2.lock().unwrap_or_else(|e| e.into_inner()) = "✓ Saved".to_string(),
-                                                Err(e) => *dl_status2.lock().unwrap_or_else(|e| e.into_inner()) = format!("✗ {e}"),
-                                            }
-                                        });
+                                        souvlaki::MediaPlayback::Paused { progress: None }
+                                    });
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('+') | KeyCode::Char('=') => {
+                                {
+                                    let mut v = volume.lock().unwrap_or_else(|e| e.into_inner());
+                                    *v = vol_up(*v);
+                                }
+                                let _ = config::save_volume(*volume.lock().unwrap_or_else(|e| e.into_inner()));
+                            }
+                            KeyCode::Down | KeyCode::Char('-') => {
+                                {
+                                    let mut v = volume.lock().unwrap_or_else(|e| e.into_inner());
+                                    *v = vol_down(*v);
+                                }
+                                let _ = config::save_volume(*volume.lock().unwrap_or_else(|e| e.into_inner()));
+                            }
+                            KeyCode::Char('?') => {
+                                show_controls = !show_controls;
+                            }
+                            KeyCode::Char('a') | KeyCode::Char('A') => {
+                                if client.is_some() && !is_local {
+                                    add_menu = Some(AddMenu { playlists: None, cursor: 0, scroll: 0 });
+                                } else {
+                                    flash = Some((
+                                        "✗ Local file — nothing to add".to_string(),
+                                        Instant::now() + Duration::from_secs(2),
+                                    ));
+                                }
+                            }
+                            KeyCode::Char('d') | KeyCode::Char('D') => {
+                                if already_saved || is_local {
+                                    *dl_flash_until.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + Duration::from_secs(2));
+                                } else {
+                                    let mut stat = dl_status.lock().unwrap_or_else(|e| e.into_inner());
+                                    if stat.is_empty() {
+                                        let already_buffered = download_done.load(Ordering::Relaxed);
+                                        if already_buffered {
+                                            // Streaming done — copy is instant, no bar needed.
+                                            // Show status in the info line only.
+                                            *stat = "✓ Saving...".to_string();
+                                            drop(stat);
+                                            let temp_path = path.to_path_buf();
+                                            let track_clone = track.clone();
+                                            let cover_owned: Option<Vec<u8>> = cover_bytes.map(|b| b.to_vec());
+                                            let out_dir = cfg.output_path();
+                                            let dl_status2 = dl_status.clone();
+                                            let dummy = Arc::new(AtomicU64::new(0));
+                                            thread::spawn(move || {
+                                                match save_streamed_track(
+                                                    &temp_path, &track_clone,
+                                                    cover_owned.as_deref(), &out_dir, &dummy,
+                                                ) {
+                                                    Ok(_) => *dl_status2.lock().unwrap_or_else(|e| e.into_inner()) = "✓ Saved".to_string(),
+                                                    Err(e) => *dl_status2.lock().unwrap_or_else(|e| e.into_inner()) = format!("✗ {e}"),
+                                                }
+                                            });
+                                        } else {
+                                            // Still buffering — show the real streaming
+                                            // progress bar (dl_bytes/dl_total already animating).
+                                            *stat = "⬇ Downloading...".to_string();
+                                            drop(stat);
+                                            let temp_path = path.to_path_buf();
+                                            let track_clone = track.clone();
+                                            let cover_owned: Option<Vec<u8>> = cover_bytes.map(|b| b.to_vec());
+                                            let dl_done = download_done.clone();
+                                            let out_dir = cfg.output_path();
+                                            let dl_status2 = dl_status.clone();
+                                            let dummy = Arc::new(AtomicU64::new(0));
+                                            thread::spawn(move || {
+                                                while !dl_done.load(Ordering::Relaxed) {
+                                                    thread::sleep(Duration::from_millis(200));
+                                                }
+                                                match save_streamed_track(
+                                                    &temp_path, &track_clone,
+                                                    cover_owned.as_deref(), &out_dir, &dummy,
+                                                ) {
+                                                    Ok(_) => *dl_status2.lock().unwrap_or_else(|e| e.into_inner()) = "✓ Saved".to_string(),
+                                                    Err(e) => *dl_status2.lock().unwrap_or_else(|e| e.into_inner()) = format!("✗ {e}"),
+                                                }
+                                            });
+                                        }
                                     }
                                 }
                             }
+                            _ => {}
                         }
-                        _ => {}
-                    }
+                        }
                 }
             }
         }

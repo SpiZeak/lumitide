@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use base64::Engine;
 use serde::Deserialize;
+use std::time::Duration;
 
 use crate::auth::Session;
 
@@ -137,6 +138,9 @@ impl From<RawTrack> for TrackInfo {
 
 // ─── Client ───────────────────────────────────────────────────────────────────
 
+// Clone is cheap (reqwest pools its connections); the transition path runs
+// track + stream fetches concurrently on cloned clients.
+#[derive(Clone)]
 pub struct TidalClient {
     pub session: Session,
     client: reqwest::blocking::Client,
@@ -146,19 +150,43 @@ impl TidalClient {
     pub fn new(session: Session) -> Self {
         let client = reqwest::blocking::Client::builder()
             .user_agent(crate::auth::TIDAL_UA)
+            // Bound every API call — blocking calls run on the UI thread,
+            // and reqwest's blocking client has no default total timeout.
+            .timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_default();
         Self { session, client }
     }
 
-    fn get(&self, path: &str, params: &[(&str, &str)]) -> Result<reqwest::blocking::Response> {
-        let url = format!("{}/{}", API_BASE, path);
-        let mut req = self.client.get(&url)
-            .header("Authorization", self.session.auth_header());
-        for &(k, v) in params {
-            req = req.query(&[(k, v)]);
+    fn get(&mut self, path: &str, params: &[(&str, &str)]) -> Result<reqwest::blocking::Response> {
+        self.send(reqwest::Method::GET, path, params, None)
+    }
+
+    fn post(
+        &mut self,
+        path: &str,
+        params: &[(&str, &str)],
+        json: Option<&serde_json::Value>,
+    ) -> Result<reqwest::blocking::Response> {
+        self.send(reqwest::Method::POST, path, params, json)
+    }
+
+    /// Send a request; on 401/403 refresh the session once and retry.
+    fn send(
+        &mut self,
+        method: reqwest::Method,
+        path: &str,
+        params: &[(&str, &str)],
+        json: Option<&serde_json::Value>,
+    ) -> Result<reqwest::blocking::Response> {
+        let mut resp = self.send_once(&method, path, params, json)?;
+        if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
+            if let Ok(new_session) = crate::auth::refresh_token(&self.session.refresh_token) {
+                let _ = crate::auth::save_session(&new_session);
+                self.session = new_session;
+                resp = self.send_once(&method, path, params, json)?;
+            }
         }
-        let resp = req.send()?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().unwrap_or_default();
@@ -167,18 +195,38 @@ impl TidalClient {
         Ok(resp)
     }
 
+    fn send_once(
+        &self,
+        method: &reqwest::Method,
+        path: &str,
+        params: &[(&str, &str)],
+        json: Option<&serde_json::Value>,
+    ) -> Result<reqwest::blocking::Response> {
+        let url = format!("{}/{}", API_BASE, path);
+        let mut req = self.client.request(method.clone(), &url)
+            .header("Authorization", self.session.auth_header())
+            .query(&[("countryCode", self.session.country_code.as_str())]);
+        if let Some(body) = json {
+            req = req.json(body);
+        }
+        for &(k, v) in params {
+            req = req.query(&[(k, v)]);
+        }
+        Ok(req.send()?)
+    }
+
     // ── Track ────────────────────────────────────────────────────────────────
 
-    pub fn track(&self, id: u64) -> Result<TrackInfo> {
+    pub fn track(&mut self, id: u64) -> Result<TrackInfo> {
         let resp = self.get(
             &format!("tracks/{}", id),
-            &[("countryCode", &self.session.country_code)],
+            &[],
         )?;
         let raw: RawTrack = resp.json()?;
         Ok(raw.into())
     }
 
-    pub fn stream_url(&self, id: u64) -> Result<StreamInfo> {
+    pub fn stream_url(&mut self, id: u64) -> Result<StreamInfo> {
         #[cfg(target_os = "windows")]
         let quality = "LOSSLESS";
         #[cfg(not(target_os = "windows"))]
@@ -191,7 +239,6 @@ impl TidalClient {
                 ("playbackmode", "STREAM"),
                 ("assetpresentation", "FULL"),
                 ("prefetchlevel", "NONE"),
-                ("countryCode", &self.session.country_code),
             ],
         )?;
 
@@ -242,7 +289,7 @@ impl TidalClient {
 
     // ── Search ───────────────────────────────────────────────────────────────
 
-    pub fn search_tracks(&self, query: &str, limit: u32) -> Result<Vec<TrackInfo>> {
+    pub fn search_tracks(&mut self, query: &str, limit: u32) -> Result<Vec<TrackInfo>> {
         #[derive(Deserialize)]
         struct SearchResp {
             tracks: Option<SearchItems>,
@@ -257,14 +304,13 @@ impl TidalClient {
             ("query", query),
             ("limit", &limit_s),
             ("types", "TRACKS"),
-            ("countryCode", &self.session.country_code),
         ])?;
         let data: SearchResp = resp.json()?;
         Ok(data.tracks.map(|t| t.items.into_iter().map(Into::into).collect())
             .unwrap_or_default())
     }
 
-    pub fn search_artists(&self, query: &str) -> Result<Vec<ArtistInfo>> {
+    pub fn search_artists(&mut self, query: &str) -> Result<Vec<ArtistInfo>> {
         #[derive(Deserialize)]
         struct SearchResp {
             artists: Option<SearchItems>,
@@ -278,7 +324,6 @@ impl TidalClient {
             ("query", query),
             ("limit", "5"),
             ("types", "ARTISTS"),
-            ("countryCode", &self.session.country_code),
         ])?;
         let data: SearchResp = resp.json()?;
         Ok(data.artists.map(|a| a.items.into_iter()
@@ -287,7 +332,7 @@ impl TidalClient {
             .unwrap_or_default())
     }
 
-    pub fn artist_top_tracks(&self, artist_id: u64, limit: u32) -> Result<Vec<TrackInfo>> {
+    pub fn artist_top_tracks(&mut self, artist_id: u64, limit: u32) -> Result<Vec<TrackInfo>> {
         #[derive(Deserialize)]
         struct Resp {
             items: Vec<RawTrack>,
@@ -295,7 +340,7 @@ impl TidalClient {
         let limit_s = limit.to_string();
         let resp = self.get(
             &format!("artists/{}/toptracks", artist_id),
-            &[("limit", &limit_s), ("countryCode", &self.session.country_code)],
+            &[("limit", &limit_s)],
         )?;
         let data: Resp = resp.json()?;
         Ok(data.items.into_iter().map(Into::into).collect())
@@ -303,7 +348,7 @@ impl TidalClient {
 
     // ── Mixes ────────────────────────────────────────────────────────────────
 
-    pub fn mixes(&self) -> Result<Vec<MixInfo>> {
+    pub fn mixes(&mut self) -> Result<Vec<MixInfo>> {
         #[derive(Deserialize)]
         struct PageResp {
             rows: Option<Vec<PageRow>>,
@@ -332,7 +377,6 @@ impl TidalClient {
         let resp = self.get("pages/my_collection_my_mixes", &[
             ("deviceType", "BROWSER"),
             ("locale", "en_US"),
-            ("countryCode", &self.session.country_code),
         ])?;
         let data: PageResp = resp.json()?;
 
@@ -355,7 +399,7 @@ impl TidalClient {
         Ok(mixes)
     }
 
-    pub fn mix_tracks(&self, mix_id: &str) -> Result<Vec<TrackInfo>> {
+    pub fn mix_tracks(&mut self, mix_id: &str) -> Result<Vec<TrackInfo>> {
         #[derive(Deserialize)]
         struct Resp {
             items: Vec<MixItem>,
@@ -372,7 +416,6 @@ impl TidalClient {
             &[
                 ("limit", "50"),
                 ("deviceType", "BROWSER"),
-                ("countryCode", &self.session.country_code),
             ],
         )?;
         let data: Resp = resp.json()?;
@@ -384,7 +427,7 @@ impl TidalClient {
 
     // ── Playlists ────────────────────────────────────────────────────────────
 
-    pub fn playlists(&self) -> Result<Vec<PlaylistInfo>> {
+    pub fn playlists(&mut self) -> Result<Vec<PlaylistInfo>> {
         #[derive(Deserialize)]
         struct Resp {
             items: Vec<RawPlaylist>,
@@ -397,7 +440,7 @@ impl TidalClient {
 
         let resp = self.get(
             &format!("users/{}/playlists", self.session.user_id),
-            &[("countryCode", &self.session.country_code), ("limit", "50")],
+            &[("limit", "50")],
         )?;
         let data: Resp = resp.json()?;
         Ok(data.items.into_iter()
@@ -405,7 +448,7 @@ impl TidalClient {
             .collect())
     }
 
-    pub fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<TrackInfo>> {
+    pub fn playlist_tracks(&mut self, playlist_id: &str) -> Result<Vec<TrackInfo>> {
         #[derive(Deserialize)]
         struct Resp {
             items: Vec<PlaylistItem>,
@@ -421,7 +464,6 @@ impl TidalClient {
             &format!("playlists/{}/items", playlist_id),
             &[
                 ("limit", "50"),
-                ("countryCode", &self.session.country_code),
             ],
         )?;
         let data: Resp = resp.json()?;
@@ -431,9 +473,42 @@ impl TidalClient {
             .collect())
     }
 
+    /// Add a track to the user's favorites (♥).
+    pub fn add_favorite_track(&mut self, track_id: u64) -> Result<()> {
+        let track_s = track_id.to_string();
+        self.post(
+            &format!("users/{}/favorites/tracks", self.session.user_id),
+            &[
+                ("trackIds", track_s.as_str()),
+            ],
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// Add a track to one of the user's playlists.
+    /// Returns Ok(false) when the track was skipped as a duplicate.
+    pub fn add_track_to_playlist(&mut self, playlist_id: &str, track_id: u64) -> Result<bool> {
+        let body = serde_json::json!({ "trackIds": [track_id] });
+        let resp = self.post(
+            &format!("playlists/{}/items", playlist_id),
+            &[
+                ("onDupes", "SKIP"),
+            ],
+            Some(&body),
+        )?;
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(rename = "addedItemIds")]
+            added_item_ids: Option<Vec<u64>>,
+        }
+        let data: Resp = resp.json().unwrap_or(Resp { added_item_ids: None });
+        Ok(data.added_item_ids.map_or(true, |ids| !ids.is_empty()))
+    }
+
     // ── Radio ────────────────────────────────────────────────────────────────
 
-    pub fn track_radio(&self, track_id: u64) -> Result<Vec<TrackInfo>> {
+    pub fn track_radio(&mut self, track_id: u64) -> Result<Vec<TrackInfo>> {
         #[derive(Deserialize)]
         struct Resp {
             items: Vec<RawTrack>,
@@ -441,7 +516,7 @@ impl TidalClient {
 
         let resp = self.get(
             &format!("tracks/{}/radio", track_id),
-            &[("limit", "50"), ("countryCode", &self.session.country_code)],
+            &[("limit", "50")],
         )?;
         let data: Resp = resp.json()?;
         Ok(data.items.into_iter().map(Into::into).collect())
@@ -449,7 +524,7 @@ impl TidalClient {
 
     // ── Library (favorites) ────────────────────────────────────────────────
 
-    pub fn album_tracks(&self, album_id: u64) -> Result<Vec<TrackInfo>> {
+    pub fn album_tracks(&mut self, album_id: u64) -> Result<Vec<TrackInfo>> {
         #[derive(Deserialize)]
         struct Resp {
             items: Vec<RawTrack>,
@@ -457,7 +532,7 @@ impl TidalClient {
 
         let resp = self.get(
             &format!("albums/{}/tracks", album_id),
-            &[("countryCode", &self.session.country_code), ("limit", "100")],
+            &[("limit", "100")],
         )?;
         let data: Resp = resp.json()?;
         Ok(data.items.into_iter().map(Into::into).collect())
@@ -466,7 +541,7 @@ impl TidalClient {
     // ── Library (page-level, for streaming) ────────────────────────────────
 
     /// Fetch a single page of liked tracks. Returns (tracks, total_count).
-    pub fn liked_tracks_page(&self, offset: u64, limit: u64) -> Result<(Vec<TrackInfo>, u64)> {
+    pub fn liked_tracks_page(&mut self, offset: u64, limit: u64) -> Result<(Vec<TrackInfo>, u64)> {
         #[derive(Deserialize)]
         struct Resp { items: Vec<FavItem>, #[serde(rename = "totalNumberOfItems")] total: Option<u64> }
         #[derive(Deserialize)]
@@ -476,7 +551,7 @@ impl TidalClient {
         let limit_s = limit.to_string();
         let resp = self.get(
             &format!("users/{}/favorites/tracks", self.session.user_id),
-            &[("countryCode", &self.session.country_code), ("limit", &limit_s), ("offset", &offset_s)],
+            &[("limit", &limit_s), ("offset", &offset_s)],
         )?;
         let data: Resp = resp.json()?;
         let total = data.total.unwrap_or(0);
@@ -484,7 +559,7 @@ impl TidalClient {
     }
 
     /// Fetch a single page of favorite albums. Returns (albums, total_count).
-    pub fn favorite_albums_page(&self, offset: u64, limit: u64) -> Result<(Vec<AlbumInfo>, u64)> {
+    pub fn favorite_albums_page(&mut self, offset: u64, limit: u64) -> Result<(Vec<AlbumInfo>, u64)> {
         #[derive(Deserialize)]
         struct Resp { items: Vec<FavItem>, #[serde(rename = "totalNumberOfItems")] total: Option<u64> }
         #[derive(Deserialize)]
@@ -496,7 +571,7 @@ impl TidalClient {
         let limit_s = limit.to_string();
         let resp = self.get(
             &format!("users/{}/favorites/albums", self.session.user_id),
-            &[("countryCode", &self.session.country_code), ("limit", &limit_s), ("offset", &offset_s)],
+            &[("limit", &limit_s), ("offset", &offset_s)],
         )?;
         let data: Resp = resp.json()?;
         let total = data.total.unwrap_or(0);
@@ -509,7 +584,7 @@ impl TidalClient {
     }
 
     /// Fetch a single page of favorite artists. Returns (artists, total_count).
-    pub fn favorite_artists_page(&self, offset: u64, limit: u64) -> Result<(Vec<ArtistInfo>, u64)> {
+    pub fn favorite_artists_page(&mut self, offset: u64, limit: u64) -> Result<(Vec<ArtistInfo>, u64)> {
         #[derive(Deserialize)]
         struct Resp { items: Vec<FavItem>, #[serde(rename = "totalNumberOfItems")] total: Option<u64> }
         #[derive(Deserialize)]
@@ -519,7 +594,7 @@ impl TidalClient {
         let limit_s = limit.to_string();
         let resp = self.get(
             &format!("users/{}/favorites/artists", self.session.user_id),
-            &[("countryCode", &self.session.country_code), ("limit", &limit_s), ("offset", &offset_s)],
+            &[("limit", &limit_s), ("offset", &offset_s)],
         )?;
         let data: Resp = resp.json()?;
         let total = data.total.unwrap_or(0);
@@ -668,7 +743,7 @@ mod tests {
 
         // ── Step 2: stream_url ────────────────────────────────────────────────
         let track_id = 86430568u64; // Netsky — Escape (known LOSSLESS track)
-        let client = TidalClient::new(session.clone());
+        let mut client = TidalClient::new(session.clone());
         let stream_info = client.stream_url(track_id).expect("stream_url failed");
         println!("[2] stream_url OK");
         println!("    url prefix  : {}", &stream_info.url[..stream_info.url.len().min(80)]);

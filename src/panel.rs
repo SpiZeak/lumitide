@@ -1,13 +1,24 @@
 use ratatui::{
-    layout::{Alignment, Constraint, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Paragraph, block::Title},
+    widgets::{Block, Borders, Clear, Paragraph},
     Frame,
 };
 
 use crate::spectrum;
 use crate::utils::fmt_time;
+
+/// Max rows shown in a menu popup before it starts scrolling.
+pub const MENU_MAX_VISIBLE: usize = 12;
+
+/// A centered modal list rendered on top of the player (e.g. add-to menu).
+pub struct MenuOverlay<'a> {
+    pub title: &'a str,
+    pub items: &'a [String],
+    pub cursor: usize,
+    pub scroll: usize,
+}
 
 /// All state the panel needs to render one frame.
 pub struct PanelState<'a> {
@@ -21,6 +32,8 @@ pub struct PanelState<'a> {
     pub volume: f32,
     pub paused: bool,
     pub dl_status: &'a str,
+    /// Transient status message (e.g. "✓ Added to favorites"); shown instead of dl_status.
+    pub flash_msg: Option<&'a str>,
     pub bar_color: Option<(u8, u8, u8)>,
     /// Pre-rendered spectrum or download-progress lines (BAR_HEIGHT rows).
     pub vis_lines: &'a [Line<'static>],
@@ -28,6 +41,7 @@ pub struct PanelState<'a> {
     pub show_controls: bool,
     pub show_controls_hint: bool,
     pub queue_status: Option<String>,
+    pub menu: Option<MenuOverlay<'a>>,
 }
 
 pub fn render(frame: &mut Frame, state: &PanelState) {
@@ -84,14 +98,12 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
         let hint_text = if state.is_local {
             "← prev  Spc pause  → next  ↑↓ vol  q/Esc quit"
         } else {
-            "← prev  Spc pause  → next  ↑↓ vol  d download  r radio  q/Esc quit"
+            "← prev  Spc pause  → next  ↑↓ vol  a add  d download  r radio  q/Esc quit"
         };
-        let controls = Title::from(Line::styled(hint_text, dim))
-            .alignment(Alignment::Center);
         let outer = Block::default()
             .borders(Borders::ALL)
             .border_style(dim)
-            .title(controls);
+            .title_top(Line::styled(hint_text, dim).centered());
         let inner = outer.inner(area);
         frame.render_widget(outer, area);
         inner
@@ -147,9 +159,14 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
         ));
     }
 
-    if !state.dl_status.is_empty() && !state.dl_status.starts_with('⬇') {
+    // A flash message (add-to result) takes priority over the download status
+    let status_line = state.flash_msg.filter(|s| !s.is_empty()).or_else(|| {
+        let s = state.dl_status;
+        if !s.is_empty() && !s.starts_with('⬇') { Some(s) } else { None }
+    });
+    if let Some(status) = status_line {
         // Show status ("✓ Saved", "✓ Saving...", "✗ Error") in the info line
-        let status_style = if state.dl_status.starts_with('✓') {
+        let status_style = if status.starts_with('✓') {
             match state.bar_color {
                 Some((r, g, b)) => Style::new().fg(Color::Rgb(r, g, b)).add_modifier(Modifier::BOLD),
                 None => Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
@@ -162,7 +179,7 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
             Style::new().add_modifier(Modifier::BOLD),
         ));
         time_line.push(Span::styled(
-            format!("  {}", state.dl_status),
+            format!("  {}", status),
             status_style,
         ));
     } else {
@@ -180,6 +197,37 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
     }
 
     frame.render_widget(Paragraph::new(Text::from(right)), cols[1]);
+
+    // ── Modal menu overlay (add to favorites / playlist) ─────────────────────
+    if let Some(menu) = &state.menu {
+        let item_w = menu.items.iter().map(|i| i.chars().count()).max().unwrap_or(0)
+            .max(menu.title.chars().count());
+        let w = (item_w as u16 + 6).min(terminal.width); // "> " + borders + padding
+        let h = (MENU_MAX_VISIBLE.min(menu.items.len()) as u16 + 2).min(terminal.height);
+        let x = terminal.x + terminal.width.saturating_sub(w) / 2;
+        let y = terminal.y + terminal.height.saturating_sub(h) / 2;
+        let area = Rect::new(x, y, w, h);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(dim)
+            .title_top(Line::styled(format!(" {} ", menu.title), dim).centered());
+        let inner = block.inner(area);
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
+
+        let items: Vec<Line> = menu.items.iter().enumerate().skip(menu.scroll)
+            .take(inner.height as usize)
+            .map(|(i, item)| {
+                if i == menu.cursor {
+                    Line::styled(format!("> {}", item), Style::new().add_modifier(Modifier::BOLD))
+                } else {
+                    Line::styled(format!("  {}", item), dim)
+                }
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(items), inner);
+    }
 }
 
 /// Build pre-rendered visualisation lines for the current frame.
