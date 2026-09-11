@@ -103,7 +103,7 @@ fn download_track(entry: &QueueEntry, http: &reqwest::blocking::Client) {
         Err(_) => {
             // Token may have expired — try to refresh once
             // (send() already retries internally, so this is a second chance)
-            if let Ok(new_session) = crate::auth::refresh_token(&entry.session.refresh_token) {
+            if let Ok(new_session) = crate::auth::refresh_token(&entry.session) {
                 let _ = crate::auth::save_session(&new_session);
                 let mut refreshed = TidalClient::new(new_session);
                 match refreshed.stream_url(entry.track.id) {
@@ -228,6 +228,7 @@ mod tests {
             user_id: 1,
             country_code: "US".to_string(),
             token_type: "Bearer".to_string(),
+            client: crate::auth::ClientKind::Pkce,
         }
     }
 

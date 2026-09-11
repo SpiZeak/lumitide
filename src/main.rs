@@ -63,12 +63,14 @@ enum Commands {
     },
     /// Open the config file in your default editor
     Config,
+    /// Log in to Tidal again (re-authorise, e.g. to upgrade to lossless)
+    Login,
 }
 
 fn main() -> Result<()> {
     // When the OS invokes us as the tidal:// URI handler, write the URL to the
     // temp file that the waiting pkce_login() is polling, then exit immediately.
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     {
         let args: Vec<String> = std::env::args().collect();
         if args.len() >= 3 && args[1] == "--auth-callback" {
@@ -120,6 +122,12 @@ fn main() -> Result<()> {
         Some(Commands::Local { debug }) => local::run(debug).map(|_| ()),
 
         Some(Commands::Config) => config::open_editor(),
+
+        Some(Commands::Login) => {
+            let session = auth::force_login()?;
+            println!("Logged in as user {} ({})", session.user_id, session.country_code);
+            Ok(())
+        }
     }
 }
 

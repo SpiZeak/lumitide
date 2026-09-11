@@ -77,6 +77,9 @@ nonce = plain[16:24]
 | Platform | Auth flow | Quality |
 |----------|-----------|---------|
 | Windows  | PKCE (browser auto-redirect) | LOSSLESS FLAC |
-| Linux / macOS | Device code | HIGH (MP4/AAC) |
+| Linux    | PKCE (temporary xdg `tidal://` handler) | LOSSLESS FLAC |
+| macOS    | Device code | HIGH (MP4/AAC) |
 
-FLAC on Linux/macOS requires registering a `tidal://` URI handler, which varies across desktop environments. It's on the roadmap.
+FLAC on macOS requires registering a `tidal://` URI handler, which works differently
+from `xdg-mime`. It's on the roadmap. On headless Linux (no `xdg-mime`/`xdg-open`),
+Lumitide falls back to the device code flow and HIGH quality.

@@ -5,18 +5,18 @@ use std::path::PathBuf;
 
 // ── Platform-specific client credentials ─────────────────────────────────────
 //
-// Windows: Tidal desktop app client — PKCE flow, no secret, issues INTERNAL
+// Windows/Linux: Tidal desktop app client — PKCE flow, no secret, issues INTERNAL
 //          tokens that unlock LOSSLESS FLAC streams.
 // Other:   Legacy third-party client — device code flow, issues BROWSER tokens
-//          that give HIGH quality (MP4/AAC). Good UX, works on all platforms.
+//          that give HIGH quality (MP4/AAC). Fallback when no desktop
+//          environment is available, and the only flow on macOS.
 
-#[cfg(target_os = "windows")]
-pub const CLIENT_ID: &str = "mhPVJJEBNRzVjr2p";
+pub const PKCE_CLIENT_ID: &str = "mhPVJJEBNRzVjr2p";
 
-#[cfg(not(target_os = "windows"))]
-pub const CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
-#[cfg(not(target_os = "windows"))]
-const CLIENT_SECRET: &str = "1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+pub const DEVICE_CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+const DEVICE_CLIENT_SECRET: &str = "1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
 
 const AUTH_BASE: &str = "https://auth.tidal.com/v1/oauth2";
 
@@ -32,6 +32,27 @@ fn session_path() -> PathBuf {
         .join("session.json")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClientKind {
+    #[serde(rename = "pkce")]
+    Pkce,
+    #[serde(rename = "device")]
+    Device,
+}
+
+/// Sessions saved before this field existed: Windows used PKCE, everything
+/// else device code.
+fn default_client_kind() -> ClientKind {
+    #[cfg(target_os = "windows")]
+    {
+        ClientKind::Pkce
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        ClientKind::Device
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub access_token: String,
@@ -41,6 +62,8 @@ pub struct Session {
     pub country_code: String,
     #[serde(default = "default_token_type")]
     pub token_type: String,
+    #[serde(default = "default_client_kind")]
+    pub client: ClientKind,
 }
 
 fn default_token_type() -> String {
@@ -70,7 +93,7 @@ pub fn get_session() -> Result<Session> {
                 if !session.is_expired() {
                     return Ok(session);
                 }
-                if let Ok(refreshed) = refresh_token(&session.refresh_token) {
+                if let Ok(refreshed) = refresh_token(&session) {
                     session = refreshed;
                     let _ = save_session(&session);
                     return Ok(session);
@@ -79,13 +102,35 @@ pub fn get_session() -> Result<Session> {
         }
     }
 
-    #[cfg(target_os = "windows")]
-    let session = pkce_login()?;
-    #[cfg(not(target_os = "windows"))]
-    let session = device_auth_flow()?;
-
+    let session = login_flow()?;
     let _ = save_session(&session);
     Ok(session)
+}
+
+/// Run the interactive login flow even if a session already exists, replacing it.
+/// Used by `lumitide login` to upgrade a device-code session to lossless-capable
+/// PKCE tokens.
+pub fn force_login() -> Result<Session> {
+    let session = login_flow()?;
+    save_session(&session)?;
+    Ok(session)
+}
+
+fn login_flow() -> Result<Session> {
+    #[cfg(target_os = "windows")]
+    return pkce_login();
+
+    #[cfg(target_os = "linux")]
+    return match pkce_login() {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            println!("Browser login failed ({e}) — falling back to device code login (HIGH quality).");
+            device_auth_flow()
+        }
+    };
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    return device_auth_flow();
 }
 
 pub fn save_session(session: &Session) -> Result<()> {
@@ -97,52 +142,52 @@ pub fn save_session(session: &Session) -> Result<()> {
     Ok(())
 }
 
-pub fn refresh_token(refresh_token: &str) -> Result<Session> {
+pub fn refresh_token(session: &Session) -> Result<Session> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(TIDAL_UA)
         .build()?;
 
-    #[cfg(target_os = "windows")]
-    let form: &[(&str, &str)] = &[
-        ("client_id", CLIENT_ID),
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-        ("scope", "r_usr w_usr"),
-    ];
-
-    #[cfg(not(target_os = "windows"))]
-    let form: &[(&str, &str)] = &[
-        ("client_id", CLIENT_ID),
-        ("client_secret", CLIENT_SECRET),
-        ("grant_type", "refresh_token"),
-        ("refresh_token", refresh_token),
-        ("scope", "r_usr w_usr"),
-    ];
+    // PKCE client has no secret; device client requires one.
+    let form: Vec<(&str, &str)> = match session.client {
+        ClientKind::Pkce => vec![
+            ("client_id", PKCE_CLIENT_ID),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", session.refresh_token.as_str()),
+            ("scope", "r_usr w_usr"),
+        ],
+        ClientKind::Device => vec![
+            ("client_id", DEVICE_CLIENT_ID),
+            ("client_secret", DEVICE_CLIENT_SECRET),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", session.refresh_token.as_str()),
+            ("scope", "r_usr w_usr"),
+        ],
+    };
 
     let resp = client
         .post(format!("{}/token", AUTH_BASE))
-        .form(form)
+        .form(&form)
         .send()?;
 
     if !resp.status().is_success() {
         return Err(anyhow!("Token refresh failed: {}", resp.status()));
     }
 
-    parse_token_response(resp.json()?, refresh_token)
+    parse_token_response(resp.json()?, &session.refresh_token, session.client)
 }
 
-// ─── Windows: PKCE login ──────────────────────────────────────────────────────
+// ─── PKCE login (Windows + Linux) ─────────────────────────────────────────────
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 const TIDAL_REDIRECT: &str = "tidal://login/auth";
 
 /// Path of the temp file the callback process writes the tidal:// URL into.
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 pub fn auth_callback_file() -> std::path::PathBuf {
     std::env::temp_dir().join("lumitide_auth.tmp")
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn pkce_login() -> Result<Session> {
     let (verifier, challenge) = pkce_pair();
     let cuk = new_uuid();
@@ -151,13 +196,16 @@ fn pkce_login() -> Result<Session> {
         "{}/authorize?client_id={}&client_unique_key={}&code_challenge={}\
          &code_challenge_method=S256&redirect_uri={}&response_type=code&scope=r_usr+w_usr",
         "https://login.tidal.com",
-        CLIENT_ID,
+        PKCE_CLIENT_ID,
         cuk,
         challenge,
         percent_encode(TIDAL_REDIRECT),
     );
 
-    pkce_login_windows(auth_url, verifier, cuk)
+    #[cfg(target_os = "windows")]
+    return pkce_login_windows(auth_url, verifier, cuk);
+    #[cfg(target_os = "linux")]
+    return pkce_login_linux(auth_url, verifier, cuk);
 }
 
 /// Temporarily register lumitide as the tidal:// handler so the OS calls us back
@@ -228,7 +276,7 @@ fn pkce_login_windows(auth_url: String, verifier: String, cuk: String) -> Result
     exchange_code(&code?, &verifier, &cuk, TIDAL_REDIRECT)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn poll_callback_file(path: &std::path::Path, timeout: std::time::Duration) -> Result<String> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
@@ -242,7 +290,7 @@ fn poll_callback_file(path: &std::path::Path, timeout: std::time::Duration) -> R
     Err(anyhow!("Timed out waiting for Tidal auth callback"))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn exchange_code(code: &str, verifier: &str, cuk: &str, redirect_uri: &str) -> Result<Session> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(TIDAL_UA)
@@ -250,7 +298,7 @@ fn exchange_code(code: &str, verifier: &str, cuk: &str, redirect_uri: &str) -> R
     let resp = client
         .post(format!("{}/token", AUTH_BASE))
         .form(&[
-            ("client_id", CLIENT_ID),
+            ("client_id", PKCE_CLIENT_ID),
             ("client_unique_key", cuk),
             ("code", code),
             ("code_verifier", verifier),
@@ -267,10 +315,122 @@ fn exchange_code(code: &str, verifier: &str, cuk: &str, redirect_uri: &str) -> R
     }
 
     println!("Login successful!");
-    parse_token_response(resp.json()?, "")
+    parse_token_response(resp.json()?, "", ClientKind::Pkce)
 }
 
-// ─── Non-Windows: device code login ──────────────────────────────────────────
+// ─── Linux: temporary tidal:// scheme handler ─────────────────────────────────
+
+#[cfg(target_os = "linux")]
+const HANDLER_DESKTOP_ID: &str = "lumitide-tidal-auth.desktop";
+
+/// Temporarily register lumitide as the tidal:// handler via a desktop entry
+/// and xdg-mime, so the OS calls us back automatically after the user logs in,
+/// then restore the original handler.
+#[cfg(target_os = "linux")]
+fn pkce_login_linux(auth_url: String, verifier: String, cuk: String) -> Result<Session> {
+    let exe =
+        std::env::current_exe().map_err(|e| anyhow!("Could not determine exe path: {}", e))?;
+
+    let apps_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from(".local/share"))
+        .join("applications");
+    let desktop_path = apps_dir.join(HANDLER_DESKTOP_ID);
+
+    let desktop_entry = format!(
+        "[Desktop Entry]\n\
+         Type=Application\n\
+         Name=Lumitide Auth\n\
+         NoDisplay=true\n\
+         Exec=\"{}\" --auth-callback %u\n\
+         MimeType=x-scheme-handler/tidal;\n",
+        exe.display()
+    );
+    std::fs::create_dir_all(&apps_dir)?;
+    std::fs::write(&desktop_path, desktop_entry)?;
+    let _ = std::process::Command::new("update-desktop-database")
+        .arg(&apps_dir)
+        .output();
+
+    let previous = previous_scheme_handler();
+    let registered = std::process::Command::new("xdg-mime")
+        .args(["default", HANDLER_DESKTOP_ID, "x-scheme-handler/tidal"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !registered {
+        unregister_scheme_handler(previous);
+        return Err(anyhow!("could not register tidal:// handler via xdg-mime"));
+    }
+
+    let callback_file = auth_callback_file();
+    let _ = std::fs::remove_file(&callback_file);
+
+    open_browser(&auth_url);
+    println!("\nOpening Tidal login in your browser...");
+    println!("If it doesn't open automatically, visit:");
+    println!("  {}\n", auth_url);
+    println!("Log in and approve — Lumitide will handle the redirect automatically.");
+    println!("Waiting for Tidal callback...\n");
+
+    let code = poll_callback_file(&callback_file, std::time::Duration::from_secs(180));
+
+    // Always restore — put the previous handler back and remove our desktop entry.
+    unregister_scheme_handler(previous);
+
+    exchange_code(&code?, &verifier, &cuk, TIDAL_REDIRECT)
+}
+
+/// Default app for x-scheme-handler/tidal, if one was set before us.
+#[cfg(target_os = "linux")]
+fn previous_scheme_handler() -> Option<String> {
+    std::process::Command::new("xdg-mime")
+        .args(["query", "default", "x-scheme-handler/tidal"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty() && s != HANDLER_DESKTOP_ID)
+}
+
+/// Restore the previous tidal:// handler (or unset ours) and delete the
+/// temporary desktop entry.
+#[cfg(target_os = "linux")]
+fn unregister_scheme_handler(previous: Option<String>) {
+    if let Some(prev) = previous {
+        let _ = std::process::Command::new("xdg-mime")
+            .args(["default", &prev, "x-scheme-handler/tidal"])
+            .output();
+    } else {
+        remove_mimeapps_default();
+    }
+    let apps_dir = dirs::data_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from(".local/share"))
+        .join("applications");
+    let _ = std::fs::remove_file(apps_dir.join(HANDLER_DESKTOP_ID));
+    let _ = std::process::Command::new("update-desktop-database")
+        .arg(&apps_dir)
+        .output();
+}
+
+/// Remove the `x-scheme-handler/tidal=` line that `xdg-mime default` wrote to
+/// ~/.config/mimeapps.list, so the scheme has no default handler again.
+#[cfg(target_os = "linux")]
+fn remove_mimeapps_default() {
+    let Some(config_dir) = dirs::config_dir() else { return };
+    let path = config_dir.join("mimeapps.list");
+    let Ok(text) = std::fs::read_to_string(&path) else { return };
+    let line = format!("x-scheme-handler/tidal={HANDLER_DESKTOP_ID}");
+    let filtered: String = text
+        .lines()
+        .filter(|l| l.trim() != line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if filtered != text {
+        let _ = std::fs::write(&path, filtered);
+    }
+}
+
+// ─── macOS / fallback: device code login ──────────────────────────────────────
 
 #[cfg(not(target_os = "windows"))]
 fn device_auth_flow() -> Result<Session> {
@@ -293,7 +453,7 @@ fn device_auth_flow() -> Result<Session> {
 
     let device: DeviceResp = client
         .post(format!("{}/device_authorization", AUTH_BASE))
-        .form(&[("client_id", CLIENT_ID), ("scope", "r_usr w_usr w_sub")])
+        .form(&[("client_id", DEVICE_CLIENT_ID), ("scope", "r_usr w_usr w_sub")])
         .send()?
         .error_for_status()?
         .json()?;
@@ -317,8 +477,8 @@ fn device_auth_flow() -> Result<Session> {
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", &device.device_code),
-                ("client_id", CLIENT_ID),
-                ("client_secret", CLIENT_SECRET),
+                ("client_id", DEVICE_CLIENT_ID),
+                ("client_secret", DEVICE_CLIENT_SECRET),
                 ("scope", "r_usr w_usr w_sub"),
             ])
             .send()?;
@@ -349,6 +509,7 @@ fn device_auth_flow() -> Result<Session> {
                 user_id: data.user.user_id,
                 country_code: data.user.country_code,
                 token_type: "Bearer".to_string(),
+                client: ClientKind::Device,
             });
         }
 
@@ -379,7 +540,11 @@ struct UserResp {
     country_code: String,
 }
 
-fn parse_token_response(data: TokenResp, fallback_refresh: &str) -> Result<Session> {
+fn parse_token_response(
+    data: TokenResp,
+    fallback_refresh: &str,
+    client: ClientKind,
+) -> Result<Session> {
     let expiry = Utc::now() + chrono::Duration::seconds(data.expires_in as i64);
     Ok(Session {
         access_token: data.access_token,
@@ -391,11 +556,12 @@ fn parse_token_response(data: TokenResp, fallback_refresh: &str) -> Result<Sessi
         user_id: data.user.as_ref().map(|u| u.user_id).unwrap_or(0),
         country_code: data.user.map(|u| u.country_code).unwrap_or_default(),
         token_type: data.token_type,
+        client,
     })
 }
 
-/// Called from the Windows PKCE login and the (ignored) playback-probe test.
-#[cfg(any(test, target_os = "windows"))]
+/// Called from the PKCE logins and the (ignored) playback-probe test.
+#[cfg(any(test, target_os = "windows", target_os = "linux"))]
 pub fn new_uuid() -> String {
     use rand::RngCore;
     let mut b = [0u8; 16];
@@ -424,7 +590,7 @@ pub fn new_uuid() -> String {
     )
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn pkce_pair() -> (String, String) {
     use base64::Engine;
     use rand::RngCore;
@@ -437,7 +603,7 @@ fn pkce_pair() -> (String, String) {
     (verifier, challenge)
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for byte in s.bytes() {
@@ -451,7 +617,7 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn extract_code_from_url(url: &str) -> Result<String> {
     let query = url.splitn(2, '?').nth(1).unwrap_or(url);
     query
@@ -462,7 +628,7 @@ fn extract_code_from_url(url: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("Could not find 'code' parameter in URL: {}", url))
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux"))]
 fn open_browser(url: &str) {
     #[cfg(target_os = "windows")]
     let _ = std::process::Command::new("powershell")
@@ -472,8 +638,6 @@ fn open_browser(url: &str) {
             &format!("Start-Process '{}'", url.replace('\'', "''")),
         ])
         .spawn();
-    #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open").arg(url).spawn();
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
 }

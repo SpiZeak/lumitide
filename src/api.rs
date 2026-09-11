@@ -181,7 +181,7 @@ impl TidalClient {
     ) -> Result<reqwest::blocking::Response> {
         let mut resp = self.send_once(&method, path, params, json)?;
         if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
-            if let Ok(new_session) = crate::auth::refresh_token(&self.session.refresh_token) {
+            if let Ok(new_session) = crate::auth::refresh_token(&self.session) {
                 let _ = crate::auth::save_session(&new_session);
                 self.session = new_session;
                 resp = self.send_once(&method, path, params, json)?;
@@ -227,10 +227,12 @@ impl TidalClient {
     }
 
     pub fn stream_url(&mut self, id: u64) -> Result<StreamInfo> {
-        #[cfg(target_os = "windows")]
-        let quality = "LOSSLESS";
-        #[cfg(not(target_os = "windows"))]
-        let quality = "HIGH";
+        // LOSSLESS (FLAC) requires INTERNAL tokens from the PKCE client;
+        // BROWSER tokens from the device-code client would silently fall back.
+        let quality = match self.session.client {
+            crate::auth::ClientKind::Pkce => "LOSSLESS",
+            crate::auth::ClientKind::Device => "HIGH",
+        };
 
         let resp = self.get(
             &format!("tracks/{}/playbackinfopostpaywall", id),

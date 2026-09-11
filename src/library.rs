@@ -738,7 +738,7 @@ fn download_album(client: &mut TidalClient, album: &crate::api::AlbumInfo, track
         let _ = std::io::stdout().flush();
 
         if client.session.is_expired() {
-            if let Ok(new_session) = crate::auth::refresh_token(&client.session.refresh_token) {
+            if let Ok(new_session) = crate::auth::refresh_token(&client.session) {
                 client.session = new_session;
                 let _ = crate::auth::save_session(&client.session);
             }
@@ -747,7 +747,7 @@ fn download_album(client: &mut TidalClient, album: &crate::api::AlbumInfo, track
         let mut stream_url_res = client.stream_url(track.id);
         if let Err(e) = &stream_url_res {
             if e.to_string().contains("401") || e.to_string().contains("403") {
-                if let Ok(new_session) = crate::auth::refresh_token(&client.session.refresh_token) {
+                if let Ok(new_session) = crate::auth::refresh_token(&client.session) {
                     client.session = new_session;
                     let _ = crate::auth::save_session(&client.session);
                     stream_url_res = client.stream_url(track.id);
@@ -760,7 +760,7 @@ fn download_album(client: &mut TidalClient, album: &crate::api::AlbumInfo, track
                 let mut resp = reqwest::blocking::Client::new().get(&url.url).send();
                 if let Ok(ref r) = resp {
                     if r.status().as_u16() == 401 || r.status().as_u16() == 403 {
-                        if let Ok(new_session) = crate::auth::refresh_token(&client.session.refresh_token) {
+                        if let Ok(new_session) = crate::auth::refresh_token(&client.session) {
                             client.session = new_session;
                             let _ = crate::auth::save_session(&client.session);
                             if let Ok(new_url) = client.stream_url(track.id) {
