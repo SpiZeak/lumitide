@@ -27,6 +27,9 @@ pub struct PanelState<'a> {
     pub artist_name: &'a str,
     pub album_name: &'a str,
     pub track_label: Option<&'a str>,
+    /// Actual audio quality of the stream/file (e.g. "FLAC 16-bit 44.1 kHz"),
+    /// probed from the decoded audio rather than what was requested.
+    pub quality_label: Option<&'a str>,
     pub elapsed: f64,
     pub total: f64,
     pub volume: f32,
@@ -53,7 +56,7 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
 
     // rows: 1 top-pad + title + artist + album + [label] + time + empty + vis
     let right_rows = 1 + 3
-        + if state.track_label.is_some() { 1 } else { 0 }
+        + if state.track_label.is_some() || state.quality_label.is_some() { 1 } else { 0 }
         + 1 + 1
         + state.vis_lines.len() as u16;
     let cover_rows = state.cover_lines.len() as u16 + 1; // +1 top-pad
@@ -141,8 +144,18 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
     right.push(Line::from(Span::styled(state.track_name.to_string(), title_style)));
     right.push(Line::from(Span::styled(state.artist_name.to_string(), dim)));
     right.push(Line::from(Span::styled(state.album_name.to_string(), dim)));
-    if let Some(label) = state.track_label {
-        right.push(Line::from(Span::styled(label.to_string(), dim)));
+    let label_spans: Vec<Span<'static>> = match (state.track_label, state.quality_label) {
+        (Some(label), Some(quality)) => vec![
+            Span::styled(label.to_string(), dim),
+            Span::styled("  ·  ".to_string(), dim),
+            Span::styled(quality.to_string(), dim),
+        ],
+        (Some(label), None) => vec![Span::styled(label.to_string(), dim)],
+        (None, Some(quality)) => vec![Span::styled(quality.to_string(), dim)],
+        (None, None) => vec![],
+    };
+    if !label_spans.is_empty() {
+        right.push(Line::from(label_spans));
     }
 
     // Time + volume line
@@ -252,5 +265,77 @@ pub fn build_vis_lines(
             spectrum::compute_spectrum(spec_buf, band_edges)
         };
         spectrum::render_spectrum(&normalized, bar_peaks, bar_peak_hold, bar_color)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    fn rendered_text(state: &PanelState) -> String {
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| render(f, state)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<Vec<_>>()
+            .chunks(100)
+            .map(|row| row.concat())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn base_state<'a>() -> PanelState<'a> {
+        PanelState {
+            cover_lines: &[],
+            track_name: "Escape",
+            artist_name: "Netsky",
+            album_name: "2",
+            track_label: None,
+            quality_label: None,
+            elapsed: 42.0,
+            total: 240.0,
+            volume: 0.5,
+            paused: false,
+            dl_status: "",
+            flash_msg: None,
+            bar_color: None,
+            vis_lines: &[],
+            is_local: false,
+            show_controls: false,
+            show_controls_hint: false,
+            queue_status: None,
+            menu: None,
+        }
+    }
+
+    #[test]
+    fn quality_label_renders_on_its_own_line() {
+        let mut state = base_state();
+        state.quality_label = Some("FLAC 16-bit 44.1 kHz");
+        let text = rendered_text(&state);
+        assert!(text.contains("FLAC 16-bit 44.1 kHz"), "quality missing:\n{text}");
+    }
+
+    #[test]
+    fn quality_label_joins_track_label_on_one_line() {
+        let mut state = base_state();
+        state.track_label = Some("Mix 3/12");
+        state.quality_label = Some("AAC 44.1 kHz");
+        let text = rendered_text(&state);
+        let line = text.lines().find(|l| l.contains("Mix 3/12")).expect("label line");
+        assert!(line.contains("AAC 44.1 kHz"), "quality not on label line:\n{line}");
+    }
+
+    #[test]
+    fn no_quality_label_renders_no_extra_line() {
+        let state = base_state();
+        let without = rendered_text(&state);
+        assert!(!without.contains("kHz"));
     }
 }

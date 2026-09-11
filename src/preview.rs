@@ -775,7 +775,7 @@ fn play(
         // Must teardown before propagating — play() owns terminal by value
         teardown_terminal(&mut terminal);
     }
-    let (sample_rate, channels) = probe_result?;
+    let (sample_rate, channels, quality_label) = probe_result?;
 
     // ── Render cover art (once) ───────────────────────────────────────────────
     let art_chars = if track_label.is_some() { 22 } else { ART_CHARS };
@@ -1115,6 +1115,7 @@ fn play(
             artist_name: &track.artist_name,
             album_name: &track.album_name,
             track_label,
+            quality_label: quality_label.as_deref(),
             elapsed: elapsed_secs,
             total: total_secs,
             volume: vol,
@@ -1373,7 +1374,7 @@ fn save_streamed_track(
 fn probe_audio(
     path: &std::path::Path,
     download_done: Arc<AtomicBool>,
-) -> Result<(u32, usize)> {
+) -> Result<(u32, usize, Option<String>)> {
     let file = fs::File::open(path)?;
     // Use StreamingFile so symphonia's internal seeks wait for data rather than
     // hitting EOF on a partially-downloaded file (required for MP4/isomp4 demuxer).
@@ -1390,7 +1391,37 @@ fn probe_audio(
         .ok_or_else(|| anyhow::anyhow!("No default track"))?;
     let sr = track.codec_params.sample_rate.unwrap_or(44100);
     let ch = track.codec_params.channels.map(|c| c.count()).unwrap_or(2);
-    Ok((sr, ch))
+    let quality = format_quality(
+        track.codec_params.codec,
+        track.codec_params.bits_per_sample,
+        sr,
+    );
+    Ok((sr, ch, quality))
+}
+
+/// Human-readable quality label for the now-playing UI, derived from the
+/// actual stream/file rather than what was requested — shows the truth when
+/// Tidal falls back to AAC.
+fn format_quality(codec: symphonia::core::codecs::CodecType, bits: Option<u32>, sr: u32) -> Option<String> {
+    use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_ALAC, CODEC_TYPE_FLAC, CODEC_TYPE_MP3, CODEC_TYPE_OPUS, CODEC_TYPE_VORBIS};
+    let codec_name = match codec {
+        CODEC_TYPE_FLAC => "FLAC",
+        CODEC_TYPE_ALAC => "ALAC",
+        CODEC_TYPE_AAC => "AAC",
+        CODEC_TYPE_MP3 => "MP3",
+        CODEC_TYPE_VORBIS => "Vorbis",
+        CODEC_TYPE_OPUS => "Opus",
+        _ => return None,
+    };
+    let khz = if sr % 1000 == 0 {
+        format!("{} kHz", sr / 1000)
+    } else {
+        format!("{:.1} kHz", sr as f64 / 1000.0)
+    };
+    match bits {
+        Some(b) => Some(format!("{codec_name} {b}-bit {khz}")),
+        None => Some(format!("{codec_name} {khz}")),
+    }
 }
 
 fn probe_total_frames(path: &std::path::Path, download_done: Arc<AtomicBool>) -> Option<u64> {
@@ -1648,4 +1679,48 @@ fn convert_audio(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_quality;
+    use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_FLAC, CODEC_TYPE_NULL, CODEC_TYPE_PCM_S16LE};
+
+    #[test]
+    fn flac_with_bit_depth_and_fractional_rate() {
+        assert_eq!(
+            format_quality(CODEC_TYPE_FLAC, Some(16), 44100),
+            Some("FLAC 16-bit 44.1 kHz".to_string())
+        );
+    }
+
+    #[test]
+    fn flac_24bit_whole_rate() {
+        assert_eq!(
+            format_quality(CODEC_TYPE_FLAC, Some(24), 96000),
+            Some("FLAC 24-bit 96 kHz".to_string())
+        );
+    }
+
+    #[test]
+    fn flac_without_bit_depth() {
+        assert_eq!(
+            format_quality(CODEC_TYPE_FLAC, None, 48000),
+            Some("FLAC 48 kHz".to_string())
+        );
+    }
+
+    #[test]
+    fn aac_shows_rate_only() {
+        assert_eq!(
+            format_quality(CODEC_TYPE_AAC, None, 44100),
+            Some("AAC 44.1 kHz".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_codecs_have_no_label() {
+        assert_eq!(format_quality(CODEC_TYPE_NULL, None, 44100), None);
+        assert_eq!(format_quality(CODEC_TYPE_PCM_S16LE, Some(16), 44100), None);
+    }
 }
