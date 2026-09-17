@@ -10,7 +10,7 @@ A terminal music player for Tidal, written in Rust.
 Stream audio from your Tidal account directly in the terminal, with album art, a live spectrum visualizer, beat/drop detection, and a background download queue.
 
 > [!NOTE]
-> **Audio quality is platform-dependent.** Windows and Linux use the Tidal desktop app auth flow (PKCE) and stream/download **lossless FLAC** by default — or **HI_RES 24-bit FLAC** with `"quality": "hi_res"` in the config (HiFi Plus). macOS uses a device code flow and receives **MP4 (HIGH quality / AAC)**.
+> **Audio quality is platform-dependent.** Windows and Linux use the Tidal desktop app auth flow (PKCE) and stream/download **HI_RES 24-bit FLAC** by default (HiFi Plus) — or **lossless FLAC** with `"quality": "lossless"` in the config. macOS uses a device code flow and receives **MP4 (HIGH quality / AAC)**.
 > See [docs/how-flac-works.md](docs/how-flac-works.md) for a full technical write-up of the auth flow and stream decryption.
 
 ![Lumitide demo](assets/demo.gif)
@@ -21,7 +21,7 @@ Stream audio from your Tidal account directly in the terminal, with album art, a
 
 ## Features
 
-- **Stream** audio from Tidal in real time — **lossless FLAC** on Windows/Linux (configurable to **HI_RES 24-bit FLAC**), **MP4/AAC** (HIGH quality) on macOS
+- **Stream** audio from Tidal in real time — **HI_RES 24-bit FLAC** on Windows/Linux (configurable down to **lossless FLAC**), **MP4/AAC** (HIGH quality) on macOS
 - **Album cover art** rendered as Braille characters in the terminal
 - **Spectrum visualizer** with peak-hold bars and beat/drop detection
 - **Album-art color theming** — title, spectrum bars, and transition arrows all take their color from the current cover

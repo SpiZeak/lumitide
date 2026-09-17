@@ -76,8 +76,8 @@ nonce = plain[16:24]
 
 | Platform | Auth flow | Quality |
 |----------|-----------|---------|
-| Windows  | PKCE (browser auto-redirect) | LOSSLESS FLAC (default), HI_RES via config |
-| Linux    | PKCE (temporary xdg `tidal://` handler) | LOSSLESS FLAC (default), HI_RES via config |
+| Windows  | PKCE (browser auto-redirect) | HI_RES FLAC (default), LOSSLESS via config |
+| Linux    | PKCE (temporary xdg `tidal://` handler) | HI_RES FLAC (default), LOSSLESS via config |
 | macOS    | Device code | HIGH (MP4/AAC) |
 
 FLAC on macOS requires registering a `tidal://` URI handler, which works differently

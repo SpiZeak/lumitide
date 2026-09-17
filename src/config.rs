@@ -39,7 +39,7 @@ fn default_output_dir() -> String { ".".to_string() }
 fn default_cover_size() -> u32 { 640 }
 fn default_volume() -> f32 { 0.5 }
 fn default_true() -> bool { true }
-fn default_quality() -> String { "lossless".to_string() }
+fn default_quality() -> String { "hi_res".to_string() }
 
 impl Default for Config {
     fn default() -> Self {
@@ -53,7 +53,7 @@ impl Default for Config {
             pywal:              false,
             calm_mode:           false,
             show_controls_hint:  true,
-            quality:             "lossless".to_string(),
+            quality:             "hi_res".to_string(),
         }
     }
 }
@@ -124,7 +124,7 @@ mod tests {
         assert!(cfg.always_color);
         assert!(!cfg.calm_mode);
         assert!(cfg.show_controls_hint);
-        assert_eq!(cfg.quality, "lossless");
+        assert_eq!(cfg.quality, "hi_res");
     }
 
     #[test]
@@ -147,7 +147,7 @@ mod tests {
         assert!((cfg.volume - 0.8).abs() < 1e-6);
         assert_eq!(cfg.search_limit, 10);
         assert_eq!(cfg.output_dir, ".");
-        assert_eq!(cfg.quality, "lossless");
+        assert_eq!(cfg.quality, "hi_res");
     }
 
     #[test]
@@ -250,7 +250,7 @@ pub fn edit_interactive() -> Result<()> {
                 let current = qualities
                     .iter()
                     .position(|q| *q == cfg.quality)
-                    .unwrap_or(1);
+                    .unwrap_or(2);
                 if let Some(picked) = Select::new()
                     .with_prompt("Stream quality")
                     .items(&labels)
