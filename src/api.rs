@@ -20,6 +20,11 @@ pub struct EncryptionInfo {
 pub struct StreamInfo {
     pub url: String,
     pub encryption: Option<EncryptionInfo>,
+    /// Quality Tidal actually served (e.g. "LOSSLESS", "HI_RES") — requesting
+    /// HI_RES without entitlement silently downgrades, so this may not match
+    /// what was asked for.
+    #[allow(dead_code)] // stored for download diagnostics / future display
+    pub quality: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,12 +232,9 @@ impl TidalClient {
     }
 
     pub fn stream_url(&mut self, id: u64) -> Result<StreamInfo> {
-        // LOSSLESS (FLAC) requires INTERNAL tokens from the PKCE client;
+        // LOSSLESS and HI_RES (FLAC) require INTERNAL tokens from the PKCE client;
         // BROWSER tokens from the device-code client would silently fall back.
-        let quality = match self.session.client {
-            crate::auth::ClientKind::Pkce => "LOSSLESS",
-            crate::auth::ClientKind::Device => "HIGH",
-        };
+        let quality = playback_quality(self.session.client, &crate::config::load().quality);
 
         let resp = self.get(
             &format!("tracks/{}/playbackinfopostpaywall", id),
@@ -249,6 +251,8 @@ impl TidalClient {
             #[serde(rename = "manifestMimeType")]
             manifest_mime_type: String,
             manifest: String,
+            #[serde(rename = "audioQuality", default)]
+            audio_quality: Option<String>,
         }
         #[derive(Deserialize)]
         struct BtsManifest {
@@ -274,7 +278,7 @@ impl TidalClient {
             } else {
                 None
             };
-            Ok(StreamInfo { url, encryption })
+            Ok(StreamInfo { url, encryption, quality: info.audio_quality })
         } else if info.manifest_mime_type.contains("dash") {
             let xml = String::from_utf8_lossy(&decoded);
             let url = xml.lines()
@@ -283,7 +287,7 @@ impl TidalClient {
                 .and_then(|l| l.split("</BaseURL>").next())
                 .map(|s| s.trim().to_string())
                 .ok_or_else(|| anyhow!("Could not extract BaseURL from DASH manifest"))?;
-            Ok(StreamInfo { url, encryption: None })
+            Ok(StreamInfo { url, encryption: None, quality: info.audio_quality })
         } else {
             Err(anyhow!("Unknown manifest type: {}", info.manifest_mime_type))
         }
@@ -614,6 +618,22 @@ impl TidalClient {
     }
 }
 
+// ─── Quality selection ───────────────────────────────────────────────────────
+
+/// Map (auth client, configured quality) to the `audioquality` API parameter.
+/// Device-flow tokens are BROWSER-scoped and silently fall back to AAC, so
+/// they always get HIGH regardless of config.
+fn playback_quality(client: crate::auth::ClientKind, cfg_quality: &str) -> &'static str {
+    match client {
+        crate::auth::ClientKind::Device => "HIGH",
+        crate::auth::ClientKind::Pkce => match cfg_quality {
+            "high" => "HIGH",
+            "hi_res" => "HI_RES",
+            _ => "LOSSLESS",
+        },
+    }
+}
+
 // ─── Encryption ──────────────────────────────────────────────────────────────
 
 // Publicly known Tidal master key used to wrap per-track AES keys.
@@ -729,6 +749,28 @@ mod tests {
         assert_eq!(t.artists, vec!["A", "B", "C"]);
     }
 
+    #[test]
+    fn playback_quality_pkce_follows_config() {
+        use crate::auth::ClientKind;
+        assert_eq!(playback_quality(ClientKind::Pkce, "high"), "HIGH");
+        assert_eq!(playback_quality(ClientKind::Pkce, "lossless"), "LOSSLESS");
+        assert_eq!(playback_quality(ClientKind::Pkce, "hi_res"), "HI_RES");
+    }
+
+    #[test]
+    fn playback_quality_unknown_config_falls_back_to_lossless() {
+        use crate::auth::ClientKind;
+        assert_eq!(playback_quality(ClientKind::Pkce, "bogus"), "LOSSLESS");
+        assert_eq!(playback_quality(ClientKind::Pkce, ""), "LOSSLESS");
+    }
+
+    #[test]
+    fn playback_quality_device_always_high() {
+        use crate::auth::ClientKind;
+        assert_eq!(playback_quality(ClientKind::Device, "hi_res"), "HIGH");
+        assert_eq!(playback_quality(ClientKind::Device, "lossless"), "HIGH");
+    }
+
     /// End-to-end: session → stream_url → download → decrypt → magic-byte check → symphonia probe.
     /// Run with: cargo test e2e_stream_decrypt -- --ignored --nocapture
     #[test]
@@ -821,6 +863,55 @@ mod tests {
         }
 
         assert!(is_flac || is_mp4, "Unrecognised audio format — magic bytes: {:02x?}", &raw[..8.min(raw.len())]);
+    }
+
+    /// Diagnostics for the HI_RES tier: what quality the account actually gets,
+    /// which manifest type it arrives in, and how it's encrypted.
+    /// Run with: cargo test e2e_hires_manifest -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a real Tidal session on disk (~/.config/lumitide/session.json)"]
+    fn e2e_hires_manifest() {
+        let session = crate::auth::get_session().expect("load session");
+        println!("    client kind = {:?}", session.client);
+        let http = reqwest::blocking::Client::builder()
+            .user_agent(crate::auth::TIDAL_UA)
+            .build()
+            .unwrap();
+
+        let track_id = 86430568u64;
+        let r = http.get(format!("https://api.tidal.com/v1/tracks/{}/playbackinfopostpaywall", track_id))
+            .header("Authorization", session.auth_header())
+            .query(&[
+                ("audioquality", "HI_RES"),
+                ("playbackmode", "STREAM"),
+                ("assetpresentation", "FULL"),
+                ("prefetchlevel", "NONE"),
+                ("countryCode", &session.country_code),
+            ])
+            .send()
+            .unwrap();
+        assert!(r.status().is_success(), "endpoint returned {}", r.status());
+        let body: serde_json::Value = r.json().unwrap();
+
+        let served = body["audioQuality"].as_str().unwrap_or("<absent>");
+        let mime = body["manifestMimeType"].as_str().unwrap_or("<absent>");
+        println!("    requested=HI_RES served={} mime={}", served, mime);
+        println!("    sampleRate={:?} bitDepth={:?}",
+            body["sampleRate"].as_u64(), body["bitDepth"].as_u64());
+
+        if let Some(m) = body["manifest"].as_str() {
+            let decoded = base64::engine::general_purpose::STANDARD.decode(m).unwrap_or_default();
+            let manifest: serde_json::Value = serde_json::from_slice(&decoded).unwrap_or(serde_json::Value::Null);
+            println!("    encryptionType={:?} urls={}",
+                manifest["encryptionType"].as_str().unwrap_or("<absent>"),
+                manifest["urls"].as_array().map(|u| u.len()).unwrap_or(0));
+            // HI_RES FLAC arrives as an encrypted BTS manifest like LOSSLESS;
+            // the existing download/decrypt pipeline handles both identically.
+            if served == "HI_RES" {
+                assert!(mime.contains("bts"), "expected BTS manifest for HI_RES");
+                assert_eq!(manifest["encryptionType"].as_str(), Some("OLD_AES"));
+            }
+        }
     }
 
     /// Probe multiple playback endpoint variants to find which works with the current token.

@@ -30,6 +30,8 @@ pub struct Config {
     pub calm_mode: bool,
     #[serde(default = "default_true")]
     pub show_controls_hint: bool,
+    #[serde(default = "default_quality")]
+    pub quality: String,
 }
 
 fn default_search_limit() -> u32 { 10 }
@@ -37,6 +39,7 @@ fn default_output_dir() -> String { ".".to_string() }
 fn default_cover_size() -> u32 { 640 }
 fn default_volume() -> f32 { 0.5 }
 fn default_true() -> bool { true }
+fn default_quality() -> String { "lossless".to_string() }
 
 impl Default for Config {
     fn default() -> Self {
@@ -48,8 +51,9 @@ impl Default for Config {
             drop_detection:     true,
             always_color:       true,
             pywal:              false,
-            calm_mode:          false,
-            show_controls_hint: true,
+            calm_mode:           false,
+            show_controls_hint:  true,
+            quality:             "lossless".to_string(),
         }
     }
 }
@@ -120,6 +124,7 @@ mod tests {
         assert!(cfg.always_color);
         assert!(!cfg.calm_mode);
         assert!(cfg.show_controls_hint);
+        assert_eq!(cfg.quality, "lossless");
     }
 
     #[test]
@@ -127,10 +132,12 @@ mod tests {
         let mut cfg = Config::default();
         cfg.volume = 0.3;
         cfg.search_limit = 25;
+        cfg.quality = "hi_res".to_string();
         let json = serde_json::to_string(&cfg).unwrap();
         let loaded: Config = serde_json::from_str(&json).unwrap();
         assert!((loaded.volume - 0.3).abs() < 1e-6);
         assert_eq!(loaded.search_limit, 25);
+        assert_eq!(loaded.quality, "hi_res");
     }
 
     #[test]
@@ -140,6 +147,7 @@ mod tests {
         assert!((cfg.volume - 0.8).abs() < 1e-6);
         assert_eq!(cfg.search_limit, 10);
         assert_eq!(cfg.output_dir, ".");
+        assert_eq!(cfg.quality, "lossless");
     }
 
     #[test]
@@ -176,6 +184,7 @@ pub fn edit_interactive() -> Result<()> {
         let items = vec![
             format!("Download folder     {}", cfg.output_dir),
             format!("Search results      {}", cfg.search_limit),
+            format!("Stream quality      {}", cfg.quality),
             format!("Drop detection      {}", if cfg.drop_detection { "on" } else { "off" }),
             format!("Always color        {}", if cfg.always_color   { "on" } else { "off" }),
             format!("Pywal colors        {}", if cfg.pywal          { "on" } else { "off" }),
@@ -231,11 +240,33 @@ pub fn edit_interactive() -> Result<()> {
                     save(&cfg)?;
                 }
             }
-            2 => { cfg.drop_detection     = Confirm::new().with_prompt("Drop detection").default(cfg.drop_detection).interact()?;     save(&cfg)?; }
-            3 => { cfg.always_color       = Confirm::new().with_prompt("Always color").default(cfg.always_color).interact()?;         save(&cfg)?; }
-            4 => { cfg.pywal              = Confirm::new().with_prompt("Pywal colors").default(cfg.pywal).interact()?;                save(&cfg)?; }
-            5 => { cfg.calm_mode          = Confirm::new().with_prompt("Calm mode").default(cfg.calm_mode).interact()?;               save(&cfg)?; }
-            6 => { cfg.show_controls_hint = Confirm::new().with_prompt("Controls hint").default(cfg.show_controls_hint).interact()?;  save(&cfg)?; }
+            2 => {
+                let qualities = ["high", "lossless", "hi_res"];
+                let labels = [
+                    "HIGH    MP4 / AAC",
+                    "LOSSLESS  FLAC 16-bit 44.1 kHz",
+                    "HI_RES    FLAC 24-bit (MQA; needs HiFi Plus + desktop auth)",
+                ];
+                let current = qualities
+                    .iter()
+                    .position(|q| *q == cfg.quality)
+                    .unwrap_or(1);
+                if let Some(picked) = Select::new()
+                    .with_prompt("Stream quality")
+                    .items(&labels)
+                    .default(current)
+                    .report(false)
+                    .interact_opt()?
+                {
+                    cfg.quality = qualities[picked].to_string();
+                    save(&cfg)?;
+                }
+            }
+            3 => { cfg.drop_detection     = Confirm::new().with_prompt("Drop detection").default(cfg.drop_detection).interact()?;     save(&cfg)?; }
+            4 => { cfg.always_color       = Confirm::new().with_prompt("Always color").default(cfg.always_color).interact()?;         save(&cfg)?; }
+            5 => { cfg.pywal              = Confirm::new().with_prompt("Pywal colors").default(cfg.pywal).interact()?;                save(&cfg)?; }
+            6 => { cfg.calm_mode          = Confirm::new().with_prompt("Calm mode").default(cfg.calm_mode).interact()?;               save(&cfg)?; }
+            7 => { cfg.show_controls_hint = Confirm::new().with_prompt("Controls hint").default(cfg.show_controls_hint).interact()?;  save(&cfg)?; }
             _ => break,
         }
     }

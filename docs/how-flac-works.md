@@ -76,10 +76,29 @@ nonce = plain[16:24]
 
 | Platform | Auth flow | Quality |
 |----------|-----------|---------|
-| Windows  | PKCE (browser auto-redirect) | LOSSLESS FLAC |
-| Linux    | PKCE (temporary xdg `tidal://` handler) | LOSSLESS FLAC |
+| Windows  | PKCE (browser auto-redirect) | LOSSLESS FLAC (default), HI_RES via config |
+| Linux    | PKCE (temporary xdg `tidal://` handler) | LOSSLESS FLAC (default), HI_RES via config |
 | macOS    | Device code | HIGH (MP4/AAC) |
 
 FLAC on macOS requires registering a `tidal://` URI handler, which works differently
 from `xdg-mime`. It's on the roadmap. On headless Linux (no `xdg-mime`/`xdg-open`),
 Lumitide falls back to the device code flow and HIGH quality.
+
+---
+
+## HI_RES (24-bit)
+
+Setting `"quality": "hi_res"` in the config (Settings → Stream quality) requests
+`audioquality=HI_RES` instead of `LOSSLESS`. This is the same BTS/OLD_AES pipeline
+described above — the CDN file is a standard FLAC container (MQA-encoded), so
+downloading, decryption, tagging, and playback work unchanged. The UI shows the
+actual bit depth/rate probed from the file (e.g. "FLAC 24-bit 48 kHz"); without
+MQA hardware, the base layer plays.
+
+Notes:
+
+- Requires a **HiFi Plus** subscription and INTERNAL (PKCE) tokens. If the
+  account isn't entitled, Tidal **silently serves a lower tier** — the response's
+  `audioQuality` field says what actually arrived, which Lumitide stores in
+  `StreamInfo.quality`.
+- Device-code sessions (macOS) always get HIGH regardless of the setting.

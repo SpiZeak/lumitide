@@ -10,7 +10,7 @@ A terminal music player for Tidal, written in Rust.
 Stream audio from your Tidal account directly in the terminal, with album art, a live spectrum visualizer, beat/drop detection, and a background download queue.
 
 > [!NOTE]
-> **Audio quality is platform-dependent.** Windows and Linux use the Tidal desktop app auth flow (PKCE) and stream/download **lossless FLAC**. macOS uses a device code flow and receives **MP4 (HIGH quality / AAC)**.
+> **Audio quality is platform-dependent.** Windows and Linux use the Tidal desktop app auth flow (PKCE) and stream/download **lossless FLAC** by default — or **HI_RES 24-bit FLAC** with `"quality": "hi_res"` in the config (HiFi Plus). macOS uses a device code flow and receives **MP4 (HIGH quality / AAC)**.
 > See [docs/how-flac-works.md](docs/how-flac-works.md) for a full technical write-up of the auth flow and stream decryption.
 
 ![Lumitide demo](assets/demo.gif)
@@ -21,7 +21,7 @@ Stream audio from your Tidal account directly in the terminal, with album art, a
 
 ## Features
 
-- **Stream** audio from Tidal in real time — **lossless FLAC** on Windows/Linux, **MP4/AAC** (HIGH quality) on macOS
+- **Stream** audio from Tidal in real time — **lossless FLAC** on Windows/Linux (configurable to **HI_RES 24-bit FLAC**), **MP4/AAC** (HIGH quality) on macOS
 - **Album cover art** rendered as Braille characters in the terminal
 - **Spectrum visualizer** with peak-hold bars and beat/drop detection
 - **Album-art color theming** — title, spectrum bars, and transition arrows all take their color from the current cover
@@ -204,6 +204,7 @@ Run `lumitide config` to open the config menu. Settings are stored at
 | `pywal` | `false` | Use [Pywal](https://github.com/dylanaraps/pywal) palette instead of album-art colors (reads `~/.cache/wal/colors.json` on all platforms) |
 | `calm_mode` | `false` | Static spectrum shape, no drop/beat effects |
 | `show_controls_hint` | `true` | Show "Press ? for ctrl" hint in the corner |
+| `quality` | `lossless` | Stream/download quality: `high` (MP4/AAC), `lossless` (FLAC 16-bit), `hi_res` (FLAC 24-bit, MQA; needs HiFi Plus and desktop auth — Tidal silently serves a lower tier if the account isn't entitled) |
 
 ## Performance
 
