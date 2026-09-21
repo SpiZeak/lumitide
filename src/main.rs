@@ -8,6 +8,7 @@ mod library;
 mod local;
 mod metadata;
 mod mix;
+mod output_codec;
 mod panel;
 mod playlist;
 mod radio;

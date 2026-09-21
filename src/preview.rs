@@ -32,6 +32,7 @@ use crate::api::{PlaylistInfo, TidalClient, TrackInfo};
 use crate::color_state::{self, ColorState};
 use crate::config;
 use crate::cover::{render_cover, render_placeholder, ART_CHARS};
+use crate::output_codec;
 use crate::panel::{self, PanelState};
 use crate::spectrum::{self, FFT_SIZE, NUM_BARS};
 
@@ -776,6 +777,16 @@ fn play(
         teardown_terminal(&mut terminal);
     }
     let (sample_rate, channels, quality_label) = probe_result?;
+
+    // Append the transport codec (e.g. LDAC) when the default output is a
+    // Bluetooth device, so the label reads "FLAC 24-bit 44.1 kHz → LDAC".
+    let quality_label = match output_codec::detect() {
+        Some(codec) => match quality_label {
+            Some(q) => Some(format!("{q} → {codec}")),
+            None => Some(codec),
+        },
+        None => quality_label,
+    };
 
     // ── Render cover art (once) ───────────────────────────────────────────────
     let art_chars = if track_label.is_some() { 22 } else { ART_CHARS };
