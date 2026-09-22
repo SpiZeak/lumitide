@@ -409,6 +409,8 @@ impl TidalClient {
         #[derive(Deserialize)]
         struct Resp {
             items: Vec<MixItem>,
+            #[serde(rename = "totalNumberOfItems", default)]
+            total: Option<u64>,
         }
         #[derive(Deserialize)]
         struct MixItem {
@@ -417,18 +419,29 @@ impl TidalClient {
             item: Option<RawTrack>,
         }
 
-        let resp = self.get(
-            &format!("mixes/{}/items", mix_id),
-            &[
-                ("limit", "50"),
-                ("deviceType", "BROWSER"),
-            ],
-        )?;
-        let data: Resp = resp.json()?;
-        Ok(data.items.into_iter()
-            .filter(|i| i.item_type == "track")
-            .filter_map(|i| i.item.map(Into::into))
-            .collect())
+        let mut tracks = Vec::new();
+        let mut offset: u64 = 0;
+        loop {
+            let offset_s = offset.to_string();
+            let resp = self.get(
+                &format!("mixes/{}/items", mix_id),
+                &[
+                    ("limit", "100"),
+                    ("offset", &offset_s),
+                    ("deviceType", "BROWSER"),
+                ],
+            )?;
+            let data: Resp = resp.json()?;
+            let page_len = data.items.len() as u64;
+            tracks.extend(data.items.into_iter()
+                .filter(|i| i.item_type == "track")
+                .filter_map(|i| i.item.map(Into::into)));
+            offset += page_len;
+            if page_len == 0 || data.total.is_some_and(|t| offset >= t) {
+                break;
+            }
+        }
+        Ok(tracks)
     }
 
     // ── Playlists ────────────────────────────────────────────────────────────
@@ -458,6 +471,8 @@ impl TidalClient {
         #[derive(Deserialize)]
         struct Resp {
             items: Vec<PlaylistItem>,
+            #[serde(rename = "totalNumberOfItems", default)]
+            total: Option<u64>,
         }
         #[derive(Deserialize)]
         struct PlaylistItem {
@@ -466,17 +481,28 @@ impl TidalClient {
             item: Option<RawTrack>,
         }
 
-        let resp = self.get(
-            &format!("playlists/{}/items", playlist_id),
-            &[
-                ("limit", "50"),
-            ],
-        )?;
-        let data: Resp = resp.json()?;
-        Ok(data.items.into_iter()
-            .filter(|i| i.item_type == "track")
-            .filter_map(|i| i.item.map(Into::into))
-            .collect())
+        let mut tracks = Vec::new();
+        let mut offset: u64 = 0;
+        loop {
+            let offset_s = offset.to_string();
+            let resp = self.get(
+                &format!("playlists/{}/items", playlist_id),
+                &[
+                    ("limit", "100"),
+                    ("offset", &offset_s),
+                ],
+            )?;
+            let data: Resp = resp.json()?;
+            let page_len = data.items.len() as u64;
+            tracks.extend(data.items.into_iter()
+                .filter(|i| i.item_type == "track")
+                .filter_map(|i| i.item.map(Into::into)));
+            offset += page_len;
+            if page_len == 0 || data.total.is_some_and(|t| offset >= t) {
+                break;
+            }
+        }
+        Ok(tracks)
     }
 
     /// Add a track to the user's favorites (♥).
