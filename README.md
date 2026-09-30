@@ -27,6 +27,7 @@ Stream audio from your Tidal account directly in the terminal, with album art, a
 - **Album-art color theming** — title, spectrum bars, and transition arrows all take their color from the current cover
 - **Pywal integration** — optionally sync the color scheme with your [Pywal](https://github.com/dylanaraps/pywal) wallpaper palette
 - **Library** — browse liked tracks, saved albums, and followed artists with fuzzy search; auto-advances through results with track counter and animated transitions
+- **Recently played (cloud)** — browse the albums, mixes, and playlists in your Tidal account's recently played shelf (synced from all your devices) and replay or download them; the underlying track-level history API is not exposed to third-party clients, so this view can't record lumitide plays or show timestamps
 - **Mix mode** — browse and play your curated Tidal mixes with animated track transitions
 - **Playlist mode** — browse and play your Tidal playlists, or press `c` to create a new one
 - **Radio** — press `r` on any track to start a Tidal radio seeded from it
@@ -146,6 +147,7 @@ Running `lumitide` with no arguments opens an interactive menu:
   My mixes
   My playlists
   My library
+  Recently played
   Local files
   Config
   Quit
@@ -158,6 +160,7 @@ lumitide search "Netsky"               # search tracks by title
 lumitide search "Chase The Sun" -n 20  # increase result count
 lumitide mix                           # browse and play your Tidal mixes
 lumitide library                       # browse liked tracks, saved albums, followed artists
+lumitide history                       # browse and replay your Tidal recently played
 lumitide local                         # shuffle local audio files
 lumitide config                        # open the config file in your editor
 ```

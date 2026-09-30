@@ -4,6 +4,7 @@ mod color_state;
 mod config;
 mod cover;
 mod download_queue;
+mod history;
 mod library;
 mod local;
 mod metadata;
@@ -54,6 +55,11 @@ enum Commands {
     },
     /// Browse your library (liked tracks, saved albums, followed artists)
     Library {
+        #[arg(long, hide = true)]
+        debug: bool,
+    },
+    /// Browse and replay your Tidal recently played (cloud)
+    History {
         #[arg(long, hide = true)]
         debug: bool,
     },
@@ -118,6 +124,12 @@ fn main() -> Result<()> {
             let session = auth::get_session()?;
             let mut client = api::TidalClient::new(session);
             library::run(&mut client, debug)
+        }
+
+        Some(Commands::History { debug }) => {
+            let session = auth::get_session()?;
+            let mut client = api::TidalClient::new(session);
+            history::run(&mut client, debug)
         }
 
         Some(Commands::Local { debug }) => local::run(debug).map(|_| ()),
@@ -203,7 +215,7 @@ fn interactive_menu() -> Result<()> {
     };
     let accent_color = Color::Rgb(accent.0, accent.1, accent.2);
 
-    let options = ["Search", "My mixes", "My playlists", "My library", "Local files", "Config", "Quit"];
+    let options = ["Search", "My mixes", "My playlists", "My library", "Recently played", "Local files", "Config", "Quit"];
     let mut cursor: usize = 0;
 
     loop {
@@ -300,7 +312,7 @@ fn interactive_menu() -> Result<()> {
         drop(terminal);
 
         match choice {
-            None | Some(6) => return Ok(()),
+            None | Some(7) => return Ok(()),
             Some(0) => {
                 let query: String = dialoguer::Input::new()
                     .with_prompt("Search")
@@ -328,6 +340,11 @@ fn interactive_menu() -> Result<()> {
                 library::run(&mut client, false)?;
             }
             Some(4) => {
+                let session = auth::get_session()?;
+                let mut client = api::TidalClient::new(session);
+                history::run(&mut client, false)?;
+            }
+            Some(5) => {
                 match local::run(false)?.as_str() {
                     "mixes" => {
                         let session = auth::get_session()?;
@@ -348,7 +365,7 @@ fn interactive_menu() -> Result<()> {
                     _ => {}
                 }
             }
-            Some(5) => {
+            Some(6) => {
                 let cfg_options = ["Edit in app", "Open JSON file"];
                 if let Some(c) = dialoguer::Select::new()
                     .items(&cfg_options)

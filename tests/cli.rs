@@ -60,3 +60,11 @@ fn library_help_exits_zero() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("library") || stdout.contains("Browse"));
 }
+
+#[test]
+fn history_help_exits_zero() {
+    let out = lumitide().args(["history", "--help"]).output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("history") || stdout.contains("listening"));
+}

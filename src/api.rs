@@ -64,6 +64,29 @@ pub struct PlaylistInfo {
     pub title: String,
 }
 
+/// One entry from Tidal's server-side "Recently played" shelf.
+#[derive(Debug, Clone)]
+pub struct RecentItem {
+    pub kind: RecentKind,
+    /// Mix id, album id, or playlist uuid.
+    pub id: String,
+    pub title: String,
+    pub subtitle: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecentKind { Mix, Album, Playlist }
+
+impl RecentKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mix => "Mix",
+            Self::Album => "Album",
+            Self::Playlist => "Playlist",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // cover stored for future album art display
 pub struct AlbumInfo {
@@ -89,6 +112,82 @@ struct RawAlbum {
     copyright: Option<String>,
     #[serde(rename = "releaseDate")]
     release_date: Option<String>,
+}
+
+// ─── Recently-played page parsing ─────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RawRecentPage {
+    #[serde(default)]
+    rows: Option<Vec<RawRecentRow>>,
+}
+#[derive(Deserialize)]
+struct RawRecentRow {
+    #[serde(default)]
+    modules: Option<Vec<RawRecentModule>>,
+}
+#[derive(Deserialize)]
+struct RawRecentModule {
+    #[serde(rename = "pagedList", default)]
+    paged_list: Option<RawRecentList>,
+}
+#[derive(Deserialize)]
+struct RawRecentList {
+    #[serde(default)]
+    items: Vec<RawRecentItem>,
+}
+#[derive(Deserialize)]
+struct RawRecentItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    #[serde(default)]
+    item: Option<RawRecentEntity>,
+}
+#[derive(Deserialize)]
+struct RawRecentEntity {
+    /// Numeric for albums, hex string for mixes.
+    id: Option<serde_json::Value>,
+    /// Playlist uuid (playlists carry no `id`).
+    #[serde(default)]
+    uuid: Option<String>,
+    title: String,
+    #[serde(rename = "subTitle", default)]
+    subtitle: Option<String>,
+}
+
+fn raw_id_to_string(v: &serde_json::Value) -> Option<String> {
+    v.as_str()
+        .map(|s| s.to_string())
+        .or_else(|| v.as_u64().map(|n| n.to_string()))
+}
+
+fn recent_items_from_page(page: &RawRecentPage) -> Vec<RecentItem> {
+    let mut out = Vec::new();
+    for row in page.rows.iter().flatten() {
+        for module in row.modules.iter().flatten() {
+            let Some(list) = &module.paged_list else { continue };
+            for item in &list.items {
+                let Some(entity) = &item.item else { continue };
+                let kind_id = match item.item_type.as_str() {
+                    "MIX" => entity.id.as_ref().and_then(raw_id_to_string)
+                        .map(|id| (RecentKind::Mix, id)),
+                    "ALBUM" => entity.id.as_ref().and_then(raw_id_to_string)
+                        .map(|id| (RecentKind::Album, id)),
+                    "PLAYLIST" => entity.uuid.as_ref().map(|id| (RecentKind::Playlist, id.clone())),
+                    _ => None,
+                };
+                if let Some((kind, id)) = kind_id {
+                    out.push(RecentItem {
+                        kind,
+                        id,
+                        title: entity.title.clone(),
+                        subtitle: entity.subtitle.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out
 }
 
 #[derive(Deserialize)]
@@ -565,6 +664,21 @@ impl TidalClient {
         Ok(data.added_item_ids.map_or(true, |ids| !ids.is_empty()))
     }
 
+    // ── Recently played (cloud) ──────────────────────────────────────────────
+
+    /// Tidal's server-side "Recently played" shelf — albums, mixes, and
+    /// playlists played on any device. Read-only: the track-level
+    /// `/users/{id}/history` endpoints from the API docs are 404-dead, so
+    /// third-party clients can neither read finer detail nor add markers.
+    pub fn recently_played(&mut self) -> Result<Vec<RecentItem>> {
+        let resp = self.get("pages/recently_played", &[
+            ("deviceType", "BROWSER"),
+            ("locale", "en_US"),
+        ])?;
+        let page: RawRecentPage = resp.json()?;
+        Ok(recent_items_from_page(&page))
+    }
+
     // ── Radio ────────────────────────────────────────────────────────────────
 
     pub fn track_radio(&mut self, track_id: u64) -> Result<Vec<TrackInfo>> {
@@ -822,6 +936,44 @@ mod tests {
         use crate::auth::ClientKind;
         assert_eq!(playback_quality(ClientKind::Device, "hi_res"), "HIGH");
         assert_eq!(playback_quality(ClientKind::Device, "lossless"), "HIGH");
+    }
+
+    #[test]
+    fn recent_page_parses_mixes_albums_and_playlists() {
+        // Captured (shortened) from GET /v1/pages/recently_played — mixes use
+        // string ids, albums numeric ids, playlists only a uuid.
+        let json = r#"{"rows":[{"modules":[{"pagedList":{"items":[
+            {"type":"MIX","item":{"id":"001a3f046bd48d081b3e9d7d801b9d","title":"Drunk Tonight","subTitle":"DAWNLINE"}},
+            {"type":"ALBUM","item":{"id":539897117,"title":"Drunk Tonight"}},
+            {"type":"PLAYLIST","item":{"uuid":"3dc8851a-8bf0-4add-a1a6-1a226cb9d611","title":"Lily - Favoriter"}}
+        ]}}]}]}"#;
+        let page: RawRecentPage = serde_json::from_str(json).unwrap();
+        let items = recent_items_from_page(&page);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].kind, RecentKind::Mix);
+        assert_eq!(items[0].id, "001a3f046bd48d081b3e9d7d801b9d");
+        assert_eq!(items[0].subtitle.as_deref(), Some("DAWNLINE"));
+        assert_eq!(items[1].kind, RecentKind::Album);
+        assert_eq!(items[1].id, "539897117");
+        assert_eq!(items[2].kind, RecentKind::Playlist);
+        assert_eq!(items[2].id, "3dc8851a-8bf0-4add-a1a6-1a226cb9d611");
+    }
+
+    #[test]
+    fn recent_page_skips_unknown_and_idless_items() {
+        let json = r#"{"rows":[{"modules":[{"pagedList":{"items":[
+            {"type":"VIDEO","item":{"id":"123","title":"A video"}},
+            {"type":"PLAYLIST","item":{"title":"No uuid here"}},
+            {"type":"MIX"}
+        ]}}]}]}"#;
+        let page: RawRecentPage = serde_json::from_str(json).unwrap();
+        assert!(recent_items_from_page(&page).is_empty());
+    }
+
+    #[test]
+    fn recent_page_handles_missing_rows_and_modules() {
+        let page: RawRecentPage = serde_json::from_str("{}").unwrap();
+        assert!(recent_items_from_page(&page).is_empty());
     }
 
     /// End-to-end: session → stream_url → download → decrypt → magic-byte check → symphonia probe.
