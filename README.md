@@ -28,9 +28,9 @@ Stream audio from your Tidal account directly in the terminal, with album art, a
 - **Pywal integration** — optionally sync the color scheme with your [Pywal](https://github.com/dylanaraps/pywal) wallpaper palette
 - **Library** — browse liked tracks, saved albums, and followed artists with fuzzy search; auto-advances through results with track counter and animated transitions
 - **Mix mode** — browse and play your curated Tidal mixes with animated track transitions
-- **Playlist mode** — browse and play your Tidal playlists
+- **Playlist mode** — browse and play your Tidal playlists, or press `c` to create a new one
 - **Radio** — press `r` on any track to start a Tidal radio seeded from it
-- **Add to playlist / favorites** — press `a` while a track plays to like it or add it to one of your playlists, without interrupting playback
+- **Add to playlist / favorites** — press `a` while a track plays to like it, add it to one of your playlists, or create a new playlist with the track in it — without interrupting playback
 - **Search** — find tracks by title or artist
 - **Local playback** — shuffle local FLAC, MP3, and M4A files with the same UI
 - **Download** — press `d` while a track is playing to save it to disk; or press `d` on any album, mix, playlist, or track in a list view to queue it for **background download** without interrupting playback or navigation
@@ -173,7 +173,7 @@ lumitide config                        # open the config file in your editor
 | `Space` | Pause / resume |
 | `↑` / `+` | Volume up |
 | `↓` / `-` | Volume down |
-| `a` | Add current track to a playlist or favorites (picker overlay; playback continues) |
+| `a` | Add current track to a playlist or favorites (picker overlay; playback continues). The picker's `+ New playlist` entry creates a playlist and adds the track to it |
 | `d` | Download current track to disk |
 | `r` | Start radio from current track |
 | `?` | Toggle controls overlay |
@@ -186,6 +186,7 @@ lumitide config                        # open the config file in your editor
 | `↑` / `↓` or `k` / `j` | Navigate |
 | `Enter` | Play selected item |
 | `d` | Queue selected item for background download |
+| `c` | Create a new playlist (playlists view) |
 | `Esc` / `q` | Go back |
 
 ## Configuration

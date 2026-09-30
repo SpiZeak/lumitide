@@ -18,6 +18,15 @@ pub struct MenuOverlay<'a> {
     pub items: &'a [String],
     pub cursor: usize,
     pub scroll: usize,
+    /// When set, renders a single-line text input instead of the item list
+    /// (e.g. new-playlist name entry).
+    pub input: Option<MenuInput<'a>>,
+}
+
+/// Text-input state for a menu overlay.
+pub struct MenuInput<'a> {
+    pub text: &'a str,
+    pub help: &'a str,
 }
 
 /// All state the panel needs to render one frame.
@@ -213,10 +222,20 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
 
     // ── Modal menu overlay (add to favorites / playlist) ─────────────────────
     if let Some(menu) = &state.menu {
-        let item_w = menu.items.iter().map(|i| i.chars().count()).max().unwrap_or(0)
-            .max(menu.title.chars().count());
-        let w = (item_w as u16 + 6).min(terminal.width); // "> " + borders + padding
-        let h = (MENU_MAX_VISIBLE.min(menu.items.len()) as u16 + 2).min(terminal.height);
+        let (w, h) = if let Some(input) = &menu.input {
+            // Input box: fixed usable width + a help row under the field
+            let w = (input.text.chars().count() as u16 + 12)
+                .max((input.help.chars().count() + 4) as u16)
+                .max((menu.title.chars().count() + 4) as u16)
+                .min(terminal.width);
+            (w, 3 + 2)
+        } else {
+            let item_w = menu.items.iter().map(|i| i.chars().count()).max().unwrap_or(0)
+                .max(menu.title.chars().count());
+            let w = (item_w as u16 + 6).min(terminal.width); // "> " + borders + padding
+            let h = (MENU_MAX_VISIBLE.min(menu.items.len()) as u16 + 2).min(terminal.height);
+            (w, h)
+        };
         let x = terminal.x + terminal.width.saturating_sub(w) / 2;
         let y = terminal.y + terminal.height.saturating_sub(h) / 2;
         let area = Rect::new(x, y, w, h);
@@ -229,17 +248,37 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
         frame.render_widget(Clear, area);
         frame.render_widget(block, area);
 
-        let items: Vec<Line> = menu.items.iter().enumerate().skip(menu.scroll)
-            .take(inner.height as usize)
-            .map(|(i, item)| {
-                if i == menu.cursor {
-                    Line::styled(format!("> {}", item), Style::new().add_modifier(Modifier::BOLD))
-                } else {
-                    Line::styled(format!("  {}", item), dim)
-                }
-            })
-            .collect();
-        frame.render_widget(Paragraph::new(items), inner);
+        if let Some(input) = &menu.input {
+            // Field row with a block cursor, then a dim help row
+            let field = Line::from(vec![
+                Span::styled("> ".to_string(), dim),
+                Span::raw(input.text.to_string()),
+                Span::styled("█".to_string(), dim),
+            ]);
+            let field_h = inner.height.min(1);
+            frame.render_widget(
+                Paragraph::new(field),
+                Rect::new(inner.x, inner.y, inner.width, field_h),
+            );
+            if inner.height > 1 {
+                frame.render_widget(
+                    Paragraph::new(Line::styled(input.help.to_string(), dim)),
+                    Rect::new(inner.x, inner.y + 1, inner.width, 1),
+                );
+            }
+        } else {
+            let items: Vec<Line> = menu.items.iter().enumerate().skip(menu.scroll)
+                .take(inner.height as usize)
+                .map(|(i, item)| {
+                    if i == menu.cursor {
+                        Line::styled(format!("> {}", item), Style::new().add_modifier(Modifier::BOLD))
+                    } else {
+                        Line::styled(format!("  {}", item), dim)
+                    }
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(items), inner);
+        }
     }
 }
 
@@ -337,5 +376,23 @@ mod tests {
         let state = base_state();
         let without = rendered_text(&state);
         assert!(!without.contains("kHz"));
+    }
+
+    #[test]
+    fn menu_input_renders_text_and_help() {
+        let mut state = base_state();
+        let text = "Roadtrip".to_string();
+        state.menu = Some(MenuOverlay {
+            title: "New playlist",
+            items: &[],
+            cursor: 0,
+            scroll: 0,
+            input: Some(MenuInput { text: &text, help: "↵ create & add  Esc back" }),
+        });
+        let rendered = rendered_text(&state);
+        let field = rendered.lines().find(|l| l.contains("Roadtrip"))
+            .expect("input field line");
+        assert!(field.contains('>'), "missing prompt cursor:\n{field}");
+        assert!(rendered.contains("↵ create & add  Esc back"), "help missing:\n{rendered}");
     }
 }

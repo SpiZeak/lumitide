@@ -176,6 +176,15 @@ impl TidalClient {
         self.send(reqwest::Method::POST, path, params, json)
     }
 
+    fn put(
+        &mut self,
+        path: &str,
+        params: &[(&str, &str)],
+        json: Option<&serde_json::Value>,
+    ) -> Result<reqwest::blocking::Response> {
+        self.send(reqwest::Method::PUT, path, params, json)
+    }
+
     /// Send a request; on 401/403 refresh the session once and retry.
     fn send(
         &mut self,
@@ -503,6 +512,24 @@ impl TidalClient {
             }
         }
         Ok(tracks)
+    }
+
+    /// Create a new playlist in the user's account.
+    pub fn create_playlist(&mut self, title: &str) -> Result<PlaylistInfo> {
+        #[derive(Deserialize)]
+        struct Resp {
+            uuid: String,
+            title: String,
+        }
+
+        let body = serde_json::json!({ "title": title, "description": "" });
+        let resp = self.put(
+            &format!("users/{}/playlists", self.session.user_id),
+            &[],
+            Some(&body),
+        )?;
+        let pl: Resp = resp.json()?;
+        Ok(PlaylistInfo { id: pl.uuid, title: pl.title })
     }
 
     /// Add a track to the user's favorites (♥).

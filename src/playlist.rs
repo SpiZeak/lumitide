@@ -17,29 +17,35 @@ use ratatui::{
     Terminal,
 };
 
-use crate::api::TidalClient;
+use crate::api::{PlaylistInfo, TidalClient};
 use crate::config;
 use crate::preview;
 use crate::radio;
 use crate::utils::is_saved;
 
-enum Action { Play(usize), Queue(usize), Back }
+enum Action { Play(usize), Queue(usize), Create, Back }
 
 pub fn run(client: &mut TidalClient, debug: bool) -> Result<()> {
-    let playlists = client.playlists()?;
+    let mut playlists = client.playlists()?;
 
     if playlists.is_empty() {
         use std::io::Write;
         print!("\x1B[2J\x1B[H");
         let _ = std::io::stdout().flush();
         println!("You don't have any playlists yet.\n");
-        println!("Create a playlist in the Tidal app and it will appear here.\n");
-        dialoguer::Select::new()
-            .items(&["Back"])
+        let choice = dialoguer::Select::new()
+            .items(&["Create a playlist", "Back"])
             .default(0)
             .report(false)
             .interact_opt()?;
-        return Ok(());
+        if let Some(0) = choice {
+            if let Some(pl) = prompt_create(client)? {
+                playlists.push(pl);
+            }
+        }
+        if playlists.is_empty() {
+            return Ok(());
+        }
     }
 
     let show_hint = config::load().show_controls_hint;
@@ -84,7 +90,7 @@ pub fn run(client: &mut TidalClient, debug: bool) -> Result<()> {
                 if let Some(txt) = crate::DOWNLOAD_QUEUE
                     .get()
                     .and_then(|q| q.status())
-                    .or_else(|| show_hint.then(|| " ↵ play  d · download ".to_string()))
+                    .or_else(|| show_hint.then(|| " ↵ play  d · download  c · new ".to_string()))
                 {
                     let w = txt.chars().count() as u16;
                     let qs_area = Rect::new(
@@ -108,6 +114,7 @@ pub fn run(client: &mut TidalClient, debug: bool) -> Result<()> {
                         KeyCode::Down | KeyCode::Char('j') => { if cursor + 1 < playlists.len() { cursor += 1; } }
                         KeyCode::Enter => break Action::Play(cursor),
                         KeyCode::Char('d') | KeyCode::Char('D') => break Action::Queue(cursor),
+                        KeyCode::Char('c') | KeyCode::Char('C') => break Action::Create,
                         KeyCode::Esc | KeyCode::Char('q') => break Action::Back,
                         _ => {}
                     }
@@ -121,6 +128,12 @@ pub fn run(client: &mut TidalClient, debug: bool) -> Result<()> {
 
         match action {
             Action::Back => return Ok(()),
+            Action::Create => {
+                if let Some(pl) = prompt_create(client)? {
+                    playlists.push(pl);
+                    cursor = playlists.len() - 1;
+                }
+            }
             Action::Queue(idx) => {
                 let tracks = client.playlist_tracks(&playlists[idx].id)?;
                 if let Some(queue) = crate::DOWNLOAD_QUEUE.get() {
@@ -157,6 +170,31 @@ pub fn run(client: &mut TidalClient, debug: bool) -> Result<()> {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Prompt for a name (caller must have torn the TUI down) and create the
+/// playlist on Tidal. Returns None when cancelled or on API failure.
+fn prompt_create(client: &mut TidalClient) -> Result<Option<PlaylistInfo>> {
+    let name: String = dialoguer::Input::new()
+        .with_prompt("New playlist name")
+        .allow_empty(true)
+        .interact_text()?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    match client.create_playlist(name) {
+        Ok(pl) => Ok(Some(pl)),
+        Err(e) => {
+            println!("\n✗ Could not create playlist: {e}");
+            dialoguer::Select::new()
+                .items(&["Back"])
+                .default(0)
+                .report(false)
+                .interact_opt()?;
+            Ok(None)
         }
     }
 }

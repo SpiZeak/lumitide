@@ -660,15 +660,21 @@ fn download_to_file(
 
 // ─── Add-to-favorites / playlist menu ─────────────────────────────────────────
 
-/// Two-level modal: `playlists == None` → root menu, `Some` → playlist picker.
+/// Three-level modal: `playlists == None` → root menu, `Some` → playlist picker
+/// (with a trailing "+ New playlist" entry), `create == Some` → name input.
 struct AddMenu {
     playlists: Option<Vec<PlaylistInfo>>,
+    /// Buffered name while creating a playlist inline.
+    create: Option<String>,
     cursor: usize,
     scroll: usize,
 }
 
+/// Label of the trailing create-playlist entry in the picker.
+const NEW_PLAYLIST_ITEM: &str = "+ New playlist";
+
 fn add_menu_len(menu: &AddMenu) -> usize {
-    menu.playlists.as_ref().map_or(2, |p| p.len())
+    menu.playlists.as_ref().map_or(2, |p| p.len() + 1)
 }
 
 fn flash_msg(msg: String, flash: &mut Option<(String, Instant)>) {
@@ -694,6 +700,38 @@ fn add_menu_key(
 ) {
     let Some(mut m) = menu.take() else { return };
     let mut reopen = true;
+
+    // Name-input mode: every key edits the buffer (or submits / cancels).
+    if let Some(buf) = m.create.as_mut() {
+        match key {
+            KeyCode::Enter => {
+                let title = buf.trim().to_owned();
+                if title.is_empty() {
+                    flash_msg("✗ Enter a name".into(), flash);
+                } else {
+                    match client.create_playlist(&title)
+                        .and_then(|pl| client.add_track_to_playlist(&pl.id, track_id).map(|_| pl))
+                    {
+                        Ok(pl) => flash_msg(format!("✓ Created {}", pl.title), flash),
+                        Err(e) => flash_msg(format!("✗ {e}"), flash),
+                    }
+                    m.create = None;
+                    reopen = false;
+                }
+            }
+            KeyCode::Esc => {
+                // Back out of the input to the playlist picker
+                m.create = None;
+                m.cursor = m.playlists.as_ref().map_or(0, |l| l.len());
+            }
+            KeyCode::Backspace => { buf.pop(); }
+            KeyCode::Char(c) => { buf.push(c); }
+            _ => {}
+        }
+        if reopen { *menu = Some(m); }
+        return;
+    }
+
     match key {
         KeyCode::Up | KeyCode::Char('k') => m.cursor = m.cursor.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => {
@@ -710,10 +748,8 @@ fn add_menu_key(
                     reopen = false;
                 }
                 None => match client.playlists() {
-                    Ok(list) if list.is_empty() => {
-                        flash_msg("✗ No playlists yet".into(), flash);
-                        reopen = false;
-                    }
+                    // Even an empty account gets the picker — its only entry
+                    // is "+ New playlist".
                     Ok(list) => {
                         m.playlists = Some(list);
                         m.cursor = 0;
@@ -725,13 +761,18 @@ fn add_menu_key(
                     }
                 },
                 Some(list) => {
-                    let pl = &list[m.cursor.min(list.len() - 1)];
-                    match client.add_track_to_playlist(&pl.id, track_id) {
-                        Ok(true) => flash_msg(format!("✓ Added to {}", pl.title), flash),
-                        Ok(false) => flash_msg(format!("✓ Already in {}", pl.title), flash),
-                        Err(e) => flash_msg(format!("✗ {e}"), flash),
+                    if m.cursor == list.len() {
+                        // Trailing "+ New playlist" entry
+                        m.create = Some(String::new());
+                    } else {
+                        let pl = &list[m.cursor.min(list.len() - 1)];
+                        match client.add_track_to_playlist(&pl.id, track_id) {
+                            Ok(true) => flash_msg(format!("✓ Added to {}", pl.title), flash),
+                            Ok(false) => flash_msg(format!("✓ Already in {}", pl.title), flash),
+                            Err(e) => flash_msg(format!("✗ {e}"), flash),
+                        }
+                        reopen = false;
                     }
-                    reopen = false;
                 }
             }
         }
@@ -1107,14 +1148,31 @@ fn play(
         let root_items = vec!["♥ Add to favorites".to_string(), "≡ Add to playlist".to_string()];
         let playlist_titles: Vec<String> = add_menu.as_ref()
             .and_then(|m| m.playlists.as_ref())
-            .map(|list| list.iter().map(|p| p.title.clone()).collect())
+            .map(|list| {
+                let mut titles: Vec<String> = list.iter().map(|p| p.title.clone()).collect();
+                titles.push(NEW_PLAYLIST_ITEM.to_string());
+                titles
+            })
             .unwrap_or_default();
         let menu_overlay = add_menu.as_ref().map(|m| {
-            let (title, items) = match &m.playlists {
-                Some(_) => ("Add to playlist", playlist_titles.as_slice()),
-                None => ("Add track", root_items.as_slice()),
-            };
-            panel::MenuOverlay { title, items, cursor: m.cursor, scroll: m.scroll }
+            if let Some(buf) = &m.create {
+                panel::MenuOverlay {
+                    title: "New playlist",
+                    items: &[],
+                    cursor: 0,
+                    scroll: 0,
+                    input: Some(panel::MenuInput {
+                        text: buf.as_str(),
+                        help: "↵ create & add  Esc back",
+                    }),
+                }
+            } else {
+                let (title, items) = match &m.playlists {
+                    Some(_) => ("Add to playlist", playlist_titles.as_slice()),
+                    None => ("Add track", root_items.as_slice()),
+                };
+                panel::MenuOverlay { title, items, cursor: m.cursor, scroll: m.scroll, input: None }
+            }
         });
         let flash_text = flash.as_ref()
             .filter(|(_, until)| Instant::now() < *until)
@@ -1205,7 +1263,7 @@ fn play(
                             }
                             KeyCode::Char('a') | KeyCode::Char('A') => {
                                 if client.is_some() && !is_local {
-                                    add_menu = Some(AddMenu { playlists: None, cursor: 0, scroll: 0 });
+                                    add_menu = Some(AddMenu { playlists: None, create: None, cursor: 0, scroll: 0 });
                                 } else {
                                     flash = Some((
                                         "✗ Local file — nothing to add".to_string(),
