@@ -15,7 +15,7 @@ Stream audio from your Tidal account directly in the terminal, with album art, a
 
 ![Lumitide demo](assets/demo.gif)
 
-**Playback:** `→/n` next &nbsp;`←/p` prev &nbsp;`Space` pause &nbsp;`↑/+` vol up &nbsp;`↓/-` vol down &nbsp;`a` add to playlist/favorites &nbsp;`d` download &nbsp;`r` radio &nbsp;`?` controls &nbsp;`q/Esc` back
+**Playback:** `→/n` next &nbsp;`←/p` prev &nbsp;`Space` pause &nbsp;`↑/+` vol up &nbsp;`↓/-` vol down &nbsp;`a` add/remove playlist · favorites &nbsp;`d` download &nbsp;`r` radio &nbsp;`?` controls &nbsp;`q/Esc` back
 
 **Lists:** `↑↓` / `jk` navigate &nbsp;`Enter` play &nbsp;`d` queue for download &nbsp;`Esc/q` back
 
@@ -31,7 +31,7 @@ Stream audio from your Tidal account directly in the terminal, with album art, a
 - **Mix mode** — browse and play your curated Tidal mixes with animated track transitions
 - **Playlist mode** — browse and play your Tidal playlists, or press `c` to create a new one
 - **Radio** — press `r` on any track to start a Tidal radio seeded from it
-- **Add to playlist / favorites** — press `a` while a track plays to like it, add it to one of your playlists, or create a new playlist with the track in it — without interrupting playback
+- **Add to playlist / favorites** — press `a` while a track plays to like it, add it to one of your playlists, or create a new playlist with the track in it — without interrupting playback; playlists already containing the track are marked `✓` in the picker, and selecting one removes it
 - **Search** — find tracks by title or artist
 - **Local playback** — shuffle local FLAC, MP3, and M4A files with the same UI
 - **Download** — press `d` while a track is playing to save it to disk; or press `d` on any album, mix, playlist, or track in a list view to queue it for **background download** without interrupting playback or navigation
@@ -176,7 +176,7 @@ lumitide config                        # open the config file in your editor
 | `Space` | Pause / resume |
 | `↑` / `+` | Volume up |
 | `↓` / `-` | Volume down |
-| `a` | Add current track to a playlist or favorites (picker overlay; playback continues). The picker's `+ New playlist` entry creates a playlist and adds the track to it |
+| `a` | Add current track to a playlist or favorites, or remove it from a playlist (picker overlay; playback continues). Playlists already containing the track are marked `✓` — selecting one removes it, others add it. The picker's `+ New playlist` entry creates a playlist and adds the track to it |
 | `d` | Download current track to disk |
 | `r` | Start radio from current track |
 | `?` | Toggle controls overlay |

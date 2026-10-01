@@ -661,9 +661,12 @@ fn download_to_file(
 // ─── Add-to-favorites / playlist menu ─────────────────────────────────────────
 
 /// Three-level modal: `playlists == None` → root menu, `Some` → playlist picker
-/// (with a trailing "+ New playlist" entry), `create == Some` → name input.
+/// (✓-marked entries contain the track; selecting one adds or removes it),
+/// `create == Some` → name input.
 struct AddMenu {
     playlists: Option<Vec<PlaylistInfo>>,
+    /// Per-playlist membership of the current track, parallel to `playlists`.
+    contains: Vec<bool>,
     /// Buffered name while creating a playlist inline.
     create: Option<String>,
     cursor: usize,
@@ -675,6 +678,18 @@ const NEW_PLAYLIST_ITEM: &str = "+ New playlist";
 
 fn add_menu_len(menu: &AddMenu) -> usize {
     menu.playlists.as_ref().map_or(2, |p| p.len() + 1)
+}
+
+/// Check which playlists contain the track. One cloned client per playlist so
+/// the scans run concurrently — serially this would freeze the UI for as many
+/// round trips as the account has playlists.
+fn playlist_membership(client: &TidalClient, playlists: &[PlaylistInfo], track_id: u64) -> Vec<bool> {
+    let handles: Vec<_> = playlists.iter().map(|pl| {
+        let mut c = client.clone();
+        let id = pl.id.clone();
+        thread::spawn(move || c.playlist_contains_track(&id, track_id).unwrap_or(false))
+    }).collect();
+    handles.into_iter().map(|h| h.join().unwrap_or(false)).collect()
 }
 
 fn flash_msg(msg: String, flash: &mut Option<(String, Instant)>) {
@@ -751,6 +766,7 @@ fn add_menu_key(
                     // Even an empty account gets the picker — its only entry
                     // is "+ New playlist".
                     Ok(list) => {
+                        m.contains = playlist_membership(client, &list, track_id);
                         m.playlists = Some(list);
                         m.cursor = 0;
                         m.scroll = 0;
@@ -765,10 +781,23 @@ fn add_menu_key(
                         // Trailing "+ New playlist" entry
                         m.create = Some(String::new());
                     } else {
-                        let pl = &list[m.cursor.min(list.len() - 1)];
-                        match client.add_track_to_playlist(&pl.id, track_id) {
-                            Ok(true) => flash_msg(format!("✓ Added to {}", pl.title), flash),
-                            Ok(false) => flash_msg(format!("✓ Already in {}", pl.title), flash),
+                        let idx = m.cursor.min(list.len() - 1);
+                        let pl = &list[idx];
+                        // Marked entries contain the track — Enter removes
+                        // instead of adding.
+                        let result = if m.contains.get(idx).copied().unwrap_or(false) {
+                            client.remove_track_from_playlist(&pl.id, track_id).map(|removed| {
+                                if removed { format!("✓ Removed from {}", pl.title) }
+                                else { format!("✓ Not in {}", pl.title) }
+                            })
+                        } else {
+                            client.add_track_to_playlist(&pl.id, track_id).map(|added| {
+                                if added { format!("✓ Added to {}", pl.title) }
+                                else { format!("✓ Already in {}", pl.title) }
+                            })
+                        };
+                        match result {
+                            Ok(msg) => flash_msg(msg, flash),
                             Err(e) => flash_msg(format!("✗ {e}"), flash),
                         }
                         reopen = false;
@@ -1147,9 +1176,18 @@ fn play(
         }
         let root_items = vec!["♥ Add to favorites".to_string(), "≡ Add to playlist".to_string()];
         let playlist_titles: Vec<String> = add_menu.as_ref()
-            .and_then(|m| m.playlists.as_ref())
-            .map(|list| {
-                let mut titles: Vec<String> = list.iter().map(|p| p.title.clone()).collect();
+            .and_then(|m| m.playlists.as_ref().map(|list| (m.contains.as_slice(), list)))
+            .map(|(contains, list)| {
+                let mut titles: Vec<String> = list.iter().enumerate()
+                    .map(|(i, p)| {
+                        // ✓ marks playlists that already contain the track
+                        if contains.get(i).copied().unwrap_or(false) {
+                            format!("✓ {}", p.title)
+                        } else {
+                            p.title.clone()
+                        }
+                    })
+                    .collect();
                 titles.push(NEW_PLAYLIST_ITEM.to_string());
                 titles
             })
@@ -1168,7 +1206,7 @@ fn play(
                 }
             } else {
                 let (title, items) = match &m.playlists {
-                    Some(_) => ("Add to playlist", playlist_titles.as_slice()),
+                    Some(_) => ("Add / remove from playlist", playlist_titles.as_slice()),
                     None => ("Add track", root_items.as_slice()),
                 };
                 panel::MenuOverlay { title, items, cursor: m.cursor, scroll: m.scroll, input: None }
@@ -1263,7 +1301,7 @@ fn play(
                             }
                             KeyCode::Char('a') | KeyCode::Char('A') => {
                                 if client.is_some() && !is_local {
-                                    add_menu = Some(AddMenu { playlists: None, create: None, cursor: 0, scroll: 0 });
+                                    add_menu = Some(AddMenu { playlists: None, contains: Vec::new(), create: None, cursor: 0, scroll: 0 });
                                 } else {
                                     flash = Some((
                                         "✗ Local file — nothing to add".to_string(),

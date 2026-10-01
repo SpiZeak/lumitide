@@ -114,6 +114,29 @@ struct RawAlbum {
     release_date: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct RawPlaylistItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    /// Id-only: video entries don't carry the full track shape.
+    item: Option<RawPlaylistItemId>,
+}
+
+#[derive(Deserialize)]
+struct RawPlaylistItemId {
+    id: u64,
+}
+
+/// Positions (within the full, unfiltered item list) of entries that are the
+/// given track — the DELETE-items endpoint removes by playlist position, so
+/// non-track entries must not shift the count.
+fn track_positions_in_page(items: &[RawPlaylistItem], offset: u64, track_id: u64) -> Vec<u64> {
+    items.iter().enumerate()
+        .filter(|(_, i)| i.item_type == "track" && i.item.as_ref().is_some_and(|t| t.id == track_id))
+        .map(|(n, _)| offset + n as u64)
+        .collect()
+}
+
 // ─── Recently-played page parsing ─────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -263,7 +286,7 @@ impl TidalClient {
     }
 
     fn get(&mut self, path: &str, params: &[(&str, &str)]) -> Result<reqwest::blocking::Response> {
-        self.send(reqwest::Method::GET, path, params, None)
+        self.send(reqwest::Method::GET, path, params, None, &[])
     }
 
     fn post(
@@ -272,7 +295,7 @@ impl TidalClient {
         params: &[(&str, &str)],
         json: Option<&serde_json::Value>,
     ) -> Result<reqwest::blocking::Response> {
-        self.send(reqwest::Method::POST, path, params, json)
+        self.send(reqwest::Method::POST, path, params, json, &[])
     }
 
     fn put(
@@ -281,7 +304,7 @@ impl TidalClient {
         params: &[(&str, &str)],
         json: Option<&serde_json::Value>,
     ) -> Result<reqwest::blocking::Response> {
-        self.send(reqwest::Method::PUT, path, params, json)
+        self.send(reqwest::Method::PUT, path, params, json, &[])
     }
 
     /// Send a request; on 401/403 refresh the session once and retry.
@@ -291,13 +314,14 @@ impl TidalClient {
         path: &str,
         params: &[(&str, &str)],
         json: Option<&serde_json::Value>,
+        headers: &[(&str, &str)],
     ) -> Result<reqwest::blocking::Response> {
-        let mut resp = self.send_once(&method, path, params, json)?;
+        let mut resp = self.send_once(&method, path, params, json, headers)?;
         if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
             if let Ok(new_session) = crate::auth::refresh_token(&self.session) {
                 let _ = crate::auth::save_session(&new_session);
                 self.session = new_session;
-                resp = self.send_once(&method, path, params, json)?;
+                resp = self.send_once(&method, path, params, json, headers)?;
             }
         }
         if !resp.status().is_success() {
@@ -314,6 +338,7 @@ impl TidalClient {
         path: &str,
         params: &[(&str, &str)],
         json: Option<&serde_json::Value>,
+        headers: &[(&str, &str)],
     ) -> Result<reqwest::blocking::Response> {
         let url = format!("{}/{}", API_BASE, path);
         let mut req = self.client.request(method.clone(), &url)
@@ -324,6 +349,9 @@ impl TidalClient {
         }
         for &(k, v) in params {
             req = req.query(&[(k, v)]);
+        }
+        for &(k, v) in headers {
+            req = req.header(k, v);
         }
         Ok(req.send()?)
     }
@@ -664,6 +692,104 @@ impl TidalClient {
         Ok(data.added_item_ids.map_or(true, |ids| !ids.is_empty()))
     }
 
+    /// Whether a playlist already contains the track.
+    pub fn playlist_contains_track(&mut self, playlist_id: &str, track_id: u64) -> Result<bool> {
+        #[derive(Deserialize)]
+        struct Resp {
+            items: Vec<RawPlaylistItem>,
+            #[serde(rename = "totalNumberOfItems", default)]
+            total: Option<u64>,
+        }
+
+        let mut offset: u64 = 0;
+        loop {
+            let offset_s = offset.to_string();
+            let data: Resp = self.get(
+                &format!("playlists/{}/items", playlist_id),
+                &[
+                    ("limit", "100"),
+                    ("offset", &offset_s),
+                ],
+            )?.json()?;
+            let page_len = data.items.len() as u64;
+            if !track_positions_in_page(&data.items, offset, track_id).is_empty() {
+                return Ok(true);
+            }
+            offset += page_len;
+            if page_len == 0 || data.total.is_some_and(|t| offset >= t) {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Remove every occurrence of a track from one of the user's playlists.
+    /// Returns Ok(false) when the track isn't in the playlist.
+    pub fn remove_track_from_playlist(&mut self, playlist_id: &str, track_id: u64) -> Result<bool> {
+        #[derive(Deserialize)]
+        struct Resp {
+            items: Vec<RawPlaylistItem>,
+            #[serde(rename = "totalNumberOfItems", default)]
+            total: Option<u64>,
+        }
+
+        // The DELETE-items endpoint removes by playlist position, so scan the
+        // full item list (non-track entries included) and collect positions.
+        let mut indexes: Vec<u64> = Vec::new();
+        let mut etag: Option<String> = None;
+        let mut offset: u64 = 0;
+        loop {
+            let offset_s = offset.to_string();
+            let resp = self.get(
+                &format!("playlists/{}/items", playlist_id),
+                &[
+                    ("limit", "100"),
+                    ("offset", &offset_s),
+                ],
+            )?;
+            if etag.is_none() {
+                etag = resp.headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+            }
+            let data: Resp = resp.json()?;
+            let page_len = data.items.len() as u64;
+            indexes.extend(track_positions_in_page(&data.items, offset, track_id));
+            offset += page_len;
+            if page_len == 0 || data.total.is_some_and(|t| offset >= t) {
+                break;
+            }
+        }
+        if indexes.is_empty() {
+            return Ok(false);
+        }
+
+        // The write rejects stale state without the current items ETag.
+        if etag.is_none() {
+            etag = self.get(&format!("playlists/{}/etag", playlist_id), &[])?
+                .headers()
+                .get(reqwest::header::ETAG)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+        }
+        let index_path = indexes.iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let headers: &[(&str, &str)] = match etag.as_deref() {
+            Some(e) => &[("If-None-Match", e)],
+            None => &[],
+        };
+        self.send(
+            reqwest::Method::DELETE,
+            &format!("playlists/{}/items/{}", playlist_id, index_path),
+            &[],
+            None,
+            headers,
+        )?;
+        Ok(true)
+    }
+
     // ── Recently played (cloud) ──────────────────────────────────────────────
 
     /// Tidal's server-side "Recently played" shelf — albums, mixes, and
@@ -974,6 +1100,22 @@ mod tests {
     fn recent_page_handles_missing_rows_and_modules() {
         let page: RawRecentPage = serde_json::from_str("{}").unwrap();
         assert!(recent_items_from_page(&page).is_empty());
+    }
+
+    #[test]
+    fn playlist_positions_count_non_track_entries() {
+        // Captured (shortened) from GET /v1/playlists/{uuid}/items — removal
+        // targets track 111, which appears twice; a leading video must not
+        // shift the positions, and the page offset carries over.
+        let json = r#"[
+            {"type":"video","item":{"id":999,"title":"A video"}},
+            {"type":"track","item":{"id":111,"title":"Target"}},
+            {"type":"track","item":{"id":222,"title":"Other"}},
+            {"type":"track","item":{"id":111,"title":"Target again"}}
+        ]"#;
+        let items: Vec<RawPlaylistItem> = serde_json::from_str(json).unwrap();
+        assert_eq!(track_positions_in_page(&items, 5, 111), vec![6, 8]);
+        assert!(track_positions_in_page(&items, 0, 333).is_empty());
     }
 
     /// End-to-end: session → stream_url → download → decrypt → magic-byte check → symphonia probe.
