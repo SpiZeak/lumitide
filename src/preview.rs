@@ -22,11 +22,12 @@ use ratatui::{
     Terminal,
 };
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::DecoderOptions;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::codecs::{Decoder, DecoderOptions};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::units::{Time, TimeBase};
 
 use crate::api::{PlaylistInfo, TidalClient, TrackInfo};
 use crate::color_state::{self, ColorState};
@@ -49,10 +50,31 @@ const VOL_PRESETS: &[f32] = &[
 fn vol_up(v: f32)   -> f32 { VOL_PRESETS.iter().copied().find(|&p| p > v + 1e-4).unwrap_or(1.00) }
 fn vol_down(v: f32) -> f32 { VOL_PRESETS.iter().copied().rev().find(|&p| p < v - 1e-4).unwrap_or(0.0) }
 
+// ── Hold-to-seek (←/→) ──────────────────────────────────────────────────────
+/// A press shorter than this still means prev/next track.
+const HOLD_TAP_MS: u64 = 350;
+/// A gap between key events longer than this means the key was released.
+/// Auto-repeat streams pulse every ~30 ms, so this only needs to outlast a
+/// few dropped repeats.
+const HOLD_RELEASE_MS: u64 = 300;
+/// Tap timeout on terminals that never report key-release events: it must
+/// exceed the system's initial key-repeat delay (typically 250–660 ms) so a
+/// held key isn't mistaken for a tap before its first auto-repeat arrives.
+const HOLD_TAP_NO_RELEASE_MS: u64 = 750;
+/// Scrub speed as a multiple of real time: starts at SCRUB_BASE_SPEED when the
+/// hold becomes a seek, gains SCRUB_ACCEL per second held, capped at the max.
+const SCRUB_BASE_SPEED: f64 = 8.0;
+const SCRUB_ACCEL: f64 = 10.0;
+const SCRUB_MAX_SPEED: f64 = 60.0;
+
 // Persists the current song's dominant palette color so the *next* transition
 // arrow can be colored even though it runs before the next API call.
 thread_local! {
     static LAST_ARROW_COLOR: Cell<Option<(u8, u8, u8)>> = Cell::new(None);
+    /// True once the terminal reports key event kinds (repeat/release — kitty
+    /// protocol or Windows). Then "no release yet" reliably means "still
+    /// held", allowing the short tap timeout and pre-repeat scrub entry.
+    static REPORTS_EVENT_KINDS: Cell<bool> = const { Cell::new(false) };
 }
 
 type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
@@ -60,32 +82,71 @@ type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 fn setup_terminal() -> Result<AppTerminal> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
+    // Ask kitty-protocol terminals (kitty, ghostty, wezterm, foot, …) to report
+    // key repeat/release events so hold-to-seek can tell a tap from a hold.
+    // Ignored by terminals without support; Windows reports these natively.
+    #[cfg(unix)]
+    execute!(
+        stdout,
+        event::PushKeyboardEnhancementFlags(
+            event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
+    )?;
     execute!(stdout, Clear(ClearType::All), EnterAlternateScreen)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 fn teardown_terminal(terminal: &mut AppTerminal) {
+    #[cfg(unix)]
+    let _ = execute!(terminal.backend_mut(), event::PopKeyboardEnhancementFlags);
     let _ = disable_raw_mode();
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
 }
 
-/// Consume all buffered terminal events; return the last navigation direction found.
-/// Clears accumulated key presses from the OS queue so spam/hold doesn't carry over.
+/// True when another same-direction arrow event arrives within `wait` — the
+/// key is being held down (terminal auto-repeat), not tapped.
+fn arrow_stream_confirmed(dir: i8, wait: Duration) -> bool {
+    let expected = if dir > 0 { KeyCode::Right } else { KeyCode::Left };
+    if !event::poll(wait).unwrap_or(false) {
+        return false;
+    }
+    match event::read() {
+        Ok(Event::Key(k)) => {
+            (k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat)
+                && k.code == expected
+        }
+        _ => false,
+    }
+}
+
+/// Consume all buffered terminal events; return the last navigation direction
+/// found. Clears accumulated key presses from the OS queue so spam/hold
+/// doesn't carry over. An arrow key that is still auto-repeating is a scrub,
+/// not a skip — its nav is dropped so the incoming play() can handle the hold.
 fn drain_events() -> Option<&'static str> {
-    let mut last_nav: Option<&'static str> = None;
+    let mut arrow_nav: Option<&'static str> = None;
+    let mut other_nav: Option<&'static str> = None;
+    let mut last_was_arrow = false;
+    let mut last_dir = 0i8;
     while event::poll(Duration::ZERO).unwrap_or(false) {
         if let Ok(Event::Key(key)) = event::read() {
             if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
                 match key.code {
-                    KeyCode::Right | KeyCode::Char('n') | KeyCode::Char('N') => last_nav = Some("next"),
-                    KeyCode::Left  | KeyCode::Char('p') | KeyCode::Char('P') => last_nav = Some("prev"),
-                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc   => last_nav = Some("quit"),
+                    KeyCode::Right => { arrow_nav = Some("next"); last_was_arrow = true;  last_dir = 1; }
+                    KeyCode::Left  => { arrow_nav = Some("prev"); last_was_arrow = true;  last_dir = -1; }
+                    KeyCode::Char('n') | KeyCode::Char('N') => { other_nav = Some("next"); last_was_arrow = false; }
+                    KeyCode::Char('p') | KeyCode::Char('P') => { other_nav = Some("prev"); last_was_arrow = false; }
+                    KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc   => { other_nav = Some("quit"); last_was_arrow = false; }
                     _ => {}
                 }
             }
         }
     }
-    last_nav
+    if last_was_arrow && arrow_stream_confirmed(last_dir, Duration::from_millis(60)) {
+        // Held key — let play() pick it up as a scrub; a queued quit still wins
+        return other_nav;
+    }
+    if last_was_arrow { arrow_nav } else { other_nav }
 }
 
 /// Animate a directional arrow pointing to the next track label.
@@ -385,8 +446,16 @@ fn draw_transition(
             if let Ok(Event::Key(key)) = event::read() {
                 if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
                     match key.code {
-                        KeyCode::Right | KeyCode::Char('n') | KeyCode::Char('N') => return Some("next"),
-                        KeyCode::Left  | KeyCode::Char('p') | KeyCode::Char('P') => return Some("prev"),
+                        // An auto-repeating arrow means the key is held — that's
+                        // a scrub for the incoming play() to handle, not a skip
+                        KeyCode::Right | KeyCode::Left => {
+                            let dir = if key.code == KeyCode::Right { 1 } else { -1 };
+                            if !arrow_stream_confirmed(dir, Duration::from_millis(40)) {
+                                return Some(if dir > 0 { "next" } else { "prev" });
+                            }
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') => return Some("next"),
+                        KeyCode::Char('p') | KeyCode::Char('P') => return Some("prev"),
                         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc   => return Some("quit"),
                         _ => {}
                     }
@@ -821,6 +890,116 @@ fn add_menu_key(
     if reopen { *menu = Some(m); }
 }
 
+// ─── Hold-to-seek ─────────────────────────────────────────────────────────────
+
+/// Live state of a held ←/→ key. A tap still means prev/next track; holding
+/// past HOLD_TAP_MS starts a scrub that performs one seek on release.
+struct KeyHold {
+    /// +1 = forward (→), -1 = backward (←).
+    dir: i8,
+    pressed_at: Instant,
+    /// Last key event seen (press or repeat) — stalls once the key is released.
+    last_event: Instant,
+    /// Advanced every UI tick while scrubbing; drives the target position.
+    last_tick: Instant,
+    scrubbing: bool,
+    /// Set by an explicit key-release event where the terminal reports them.
+    released: bool,
+    target_secs: f64,
+}
+
+/// Scrub speed multiplier for a hold that has been seeking for `held_secs`.
+fn scrub_speed(held_secs: f64) -> f64 {
+    (SCRUB_BASE_SPEED + SCRUB_ACCEL * held_secs.max(0.0)).min(SCRUB_MAX_SPEED)
+}
+
+/// Event gap that counts as "key released". While scrubbing (or once the
+/// terminal is known to report release events) the short gap suffices;
+/// otherwise the tap timeout must outlast the key-repeat initial delay.
+fn hold_gap_ms(scrubbing: bool) -> u64 {
+    if scrubbing || REPORTS_EVENT_KINDS.with(Cell::get) {
+        HOLD_RELEASE_MS
+    } else {
+        HOLD_TAP_NO_RELEASE_MS
+    }
+}
+
+/// Switch a held arrow key from tap-pending to scrubbing: pause playback and
+/// start advancing the seek target from the current position.
+fn begin_scrub(
+    h: &mut KeyHold,
+    now: Instant,
+    elapsed_secs: f64,
+    was_paused_before_scrub: &mut bool,
+    paused: &AtomicBool,
+) {
+    h.scrubbing = true;
+    h.last_tick = now;
+    h.target_secs = elapsed_secs;
+    *was_paused_before_scrub = paused.load(Ordering::Relaxed);
+    paused.store(true, Ordering::Relaxed);
+}
+
+/// Latest pending seek command (target position in seconds), if any.
+fn drain_seeks(rx: &std::sync::mpsc::Receiver<f64>) -> Option<f64> {
+    let mut latest = None;
+    while let Ok(target) = rx.try_recv() {
+        latest = Some(target);
+    }
+    latest
+}
+
+/// Commit a finished scrub: send the seek to the decode thread and re-arm the
+/// beat/drop markers for the new position.
+fn finish_scrub(
+    h: &KeyHold,
+    seek_tx: &std::sync::mpsc::Sender<f64>,
+    beat_snap: &mut [f64],
+    beat_idx: &mut usize,
+    fired_drops: &mut std::collections::HashSet<u64>,
+) {
+    let _ = seek_tx.send(h.target_secs.max(0.0));
+    // A backward seek rewinds into beats/drops that already fired
+    *beat_idx = beat_snap.partition_point(|&t| t <= h.target_secs);
+    let target_ms = (h.target_secs * 1000.0) as u64;
+    fired_drops.retain(|&k| k < target_ms);
+}
+
+/// Execute a seek inside the decode thread: drop buffered audio, reposition the
+/// demuxer and decoder, and move the position counter to the actual landing
+/// point (in frames at the file's sample rate).
+fn apply_seek(
+    format: &mut dyn FormatReader,
+    decoder: &mut dyn Decoder,
+    audio_buf: &Arc<Mutex<VecDeque<f32>>>,
+    current_sample: &AtomicU64,
+    target_secs: f64,
+    track_id: u32,
+    sample_rate: u32,
+    time_base: Option<TimeBase>,
+) {
+    // Drop audio from the old position so playback resumes at the target
+    audio_buf.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    match format.seek(
+        SeekMode::Coarse,
+        SeekTo::Time { time: Time::from(target_secs.max(0.0)), track_id: Some(track_id) },
+    ) {
+        Ok(seeked) => {
+            decoder.reset();
+            let frames = match time_base {
+                Some(tb) => (seeked.actual_ts as f64
+                    * tb.numer as f64 * sample_rate as f64 / tb.denom as f64).round() as u64,
+                None => seeked.actual_ts,
+            };
+            current_sample.store(frames, Ordering::Relaxed);
+        }
+        Err(_) => {
+            // Unseekable region — decoding continues from wherever the demuxer
+            // is now; the position counter keeps its old value.
+        }
+    }
+}
+
 // ─── Core playback + UI loop ──────────────────────────────────────────────────
 
 fn play(
@@ -903,6 +1082,9 @@ fn play(
     let paused = Arc::new(AtomicBool::new(false));
     let stop_all = Arc::new(AtomicBool::new(false));
 
+    // Seek commands (target position in seconds) for the decode thread
+    let (seek_tx, seek_rx) = std::sync::mpsc::channel::<f64>();
+
     let dl_status: Arc<Mutex<String>> = Arc::new(Mutex::new(
         if already_saved { "✓ Saved".to_string() } else { String::new() }
     ));
@@ -964,13 +1146,32 @@ fn play(
                 Ok(d) => d,
                 Err(_) => { playback_done.store(true, Ordering::Relaxed); return; }
             };
+            let track_id = track_info.id;
+            let track_tb = track_info.codec_params.time_base;
 
             loop {
                 if stop_all.load(Ordering::Relaxed) { break; }
 
+                // A seek command flushes buffered audio and repositions the
+                // demuxer; `continue` re-enters backpressure at the new position
+                if let Some(target) = drain_seeks(&seek_rx) {
+                    apply_seek(
+                        format.as_mut(), decoder.as_mut(), &audio_buf, &current_sample,
+                        target, track_id, sample_rate, track_tb,
+                    );
+                    continue;
+                }
+
                 // Backpressure: don't decode too far ahead
                 loop {
                     if stop_all.load(Ordering::Relaxed) { return; }
+                    // Seeks must apply even while the buffer is full (paused scrub)
+                    if let Some(target) = drain_seeks(&seek_rx) {
+                        apply_seek(
+                            format.as_mut(), decoder.as_mut(), &audio_buf, &current_sample,
+                            target, track_id, sample_rate, track_tb,
+                        );
+                    }
                     let buf_len = audio_buf.lock().unwrap_or_else(|e| e.into_inner()).len();
                     if buf_len < sample_rate as usize * 3 { break; }
                     thread::sleep(Duration::from_millis(5));
@@ -1110,10 +1311,19 @@ fn play(
     let band_edges = spectrum::compute_band_edges(sample_rate);
     let mut add_menu: Option<AddMenu> = None;
     let mut flash: Option<(String, Instant)> = None;
+    let mut key_hold: Option<KeyHold> = None;
+    let mut was_paused_before_scrub = false;
+    let mut pending_resume: Option<Instant> = None;
 
     let result_str = loop {
-        let elapsed_secs = current_sample.load(Ordering::Relaxed) as f64 / sample_rate as f64;
+        let mut elapsed_secs = current_sample.load(Ordering::Relaxed) as f64 / sample_rate as f64;
         let total_secs = if total_frames > 0 { total_frames as f64 / sample_rate as f64 } else { 0.0 };
+
+        // While scrubbing, the position display follows the seek target
+        let scrub_dir = key_hold.as_ref().filter(|h| h.scrubbing).map(|h| h.dir);
+        if let Some(h) = key_hold.as_ref() {
+            if h.scrubbing { elapsed_secs = h.target_secs; }
+        }
 
         // Check for drops
         if !cfg.calm_mode {
@@ -1227,6 +1437,7 @@ fn play(
             total: total_secs,
             volume: vol,
             paused: paused.load(Ordering::Relaxed),
+            scrub_dir,
             dl_status: &dl_stat,
             flash_msg: flash_text,
             bar_color,
@@ -1243,7 +1454,69 @@ fn play(
         // ── Keyboard ─────────────────────────────────────────────────────────
         if event::poll(Duration::from_millis(90))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
+                // ←/→ drive hold-to-seek: a tap is still prev/next, holding
+                // scrubs. All key kinds are consumed so repeats/releases never
+                // leak into the bindings below.
+                let arrow_dir = match key.code {
+                    KeyCode::Right => Some(1i8),
+                    KeyCode::Left => Some(-1i8),
+                    _ => None,
+                };
+                if let Some(dir) = arrow_dir.filter(|_| add_menu.is_none()) {
+                    match key.kind {
+                        KeyEventKind::Press | KeyEventKind::Repeat => {
+                            // A Repeat kind proves the terminal reports event
+                            // kinds, so releases will arrive too
+                            if key.kind == KeyEventKind::Repeat {
+                                REPORTS_EVENT_KINDS.with(|c| c.set(true));
+                            }
+                            let now = Instant::now();
+                            let same = key_hold.as_ref().map_or(false, |h| h.dir == dir);
+                            if same {
+                                let h = key_hold.as_mut().unwrap();
+                                h.last_event = now;
+                                h.released = false;
+                                if !h.scrubbing
+                                    && now.duration_since(h.pressed_at)
+                                        >= Duration::from_millis(HOLD_TAP_MS)
+                                {
+                                    begin_scrub(
+                                        h, now, elapsed_secs,
+                                        &mut was_paused_before_scrub, &paused,
+                                    );
+                                }
+                            } else {
+                                // Direction switch mid-hold: commit the old
+                                // scrub, then start a fresh hold
+                                if let Some(old) = key_hold.take().filter(|h| h.scrubbing) {
+                                    finish_scrub(&old, &seek_tx, &mut beat_snap,
+                                                 &mut beat_idx, &mut fired_drops);
+                                    if !was_paused_before_scrub {
+                                        pending_resume =
+                                            Some(Instant::now() + Duration::from_secs(1));
+                                    }
+                                }
+                                key_hold = Some(KeyHold {
+                                    dir,
+                                    pressed_at: now,
+                                    last_event: now,
+                                    last_tick: now,
+                                    scrubbing: false,
+                                    released: false,
+                                    target_secs: elapsed_secs,
+                                });
+                            }
+                        }
+                        KeyEventKind::Release => {
+                            // Release events only exist when the terminal
+                            // reports event kinds — remember that
+                            REPORTS_EVENT_KINDS.with(|c| c.set(true));
+                            if let Some(h) = key_hold.as_mut() {
+                                if h.dir == dir { h.released = true; }
+                            }
+                        }
+                    }
+                } else if key.kind == KeyEventKind::Press {
                     // The add-to menu is modal — it consumes every key while open
                     let consumed = if add_menu.is_some() {
                         if let Some(c) = client.as_deref_mut() {
@@ -1259,11 +1532,11 @@ fn play(
                                 stop_all.store(true, Ordering::Relaxed);
                                 break "quit".to_string();
                             }
-                            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Right => {
+                            KeyCode::Char('n') | KeyCode::Char('N') => {
                                 stop_all.store(true, Ordering::Relaxed);
                                 break "next".to_string();
                             }
-                            KeyCode::Char('p') | KeyCode::Left => {
+                            KeyCode::Char('p') | KeyCode::Char('P') => {
                                 stop_all.store(true, Ordering::Relaxed);
                                 break "prev".to_string();
                             }
@@ -1271,7 +1544,8 @@ fn play(
                                 stop_all.store(true, Ordering::Relaxed);
                                 break format!("radio:{}", track.id);
                             }
-                            KeyCode::Char(' ') => {
+                            // The scrub owns the pause state while held
+                            KeyCode::Char(' ') if key_hold.as_ref().map_or(true, |h| !h.scrubbing) => {
                                 let p = paused.load(Ordering::Relaxed);
                                 paused.store(!p, Ordering::Relaxed);
                                 if let Some(ref mut mc) = media_controls {
@@ -1368,6 +1642,62 @@ fn play(
                         }
                         }
                 }
+            }
+        }
+
+        // ── Hold-to-seek: advance the scrub target, detect release ────────────
+        if let Some(h) = key_hold.as_mut() {
+            let now = Instant::now();
+            // With release events reported, "no release yet" means the key is
+            // still held — the scrub can start before the first auto-repeat
+            if !h.scrubbing
+                && !h.released
+                && REPORTS_EVENT_KINDS.with(Cell::get)
+                && now.duration_since(h.pressed_at) >= Duration::from_millis(HOLD_TAP_MS)
+            {
+                begin_scrub(h, now, elapsed_secs, &mut was_paused_before_scrub, &paused);
+            }
+            if h.scrubbing && !h.released {
+                let held = now.duration_since(h.pressed_at).as_secs_f64()
+                    - HOLD_TAP_MS as f64 / 1000.0;
+                let speed = scrub_speed(held);
+                let dt = now.duration_since(h.last_tick).as_secs_f64();
+                h.target_secs = (h.target_secs + h.dir as f64 * speed * dt)
+                    .clamp(0.0, total_secs);
+            }
+            h.last_tick = now;
+        }
+
+        let hold_gap = key_hold.as_ref().map_or(HOLD_RELEASE_MS, |h| hold_gap_ms(h.scrubbing));
+        let hold_released = key_hold.as_ref().map_or(false, |h| {
+            h.released
+                || Instant::now().duration_since(h.last_event)
+                    >= Duration::from_millis(hold_gap)
+        });
+        if hold_released {
+            let h = key_hold.take().unwrap();
+            if h.scrubbing {
+                finish_scrub(&h, &seek_tx, &mut beat_snap, &mut beat_idx, &mut fired_drops);
+                if !was_paused_before_scrub {
+                    pending_resume = Some(Instant::now() + Duration::from_secs(1));
+                }
+            } else {
+                // Tap: still prev/next track
+                stop_all.store(true, Ordering::Relaxed);
+                break (if h.dir > 0 { "next" } else { "prev" }).to_string();
+            }
+        }
+
+        // Resume after a completed seek once the buffer has data (or 1s passes)
+        if let Some(deadline) = pending_resume {
+            let buffered = audio_buf.lock().unwrap_or_else(|e| e.into_inner()).len()
+                / device_ch.max(1);
+            if buffered >= device_sr as usize / 4 || Instant::now() >= deadline {
+                paused.store(false, Ordering::Relaxed);
+                if let Some(ref mut mc) = media_controls {
+                    let _ = mc.set_playback(souvlaki::MediaPlayback::Playing { progress: None });
+                }
+                pending_resume = None;
             }
         }
 
@@ -1790,8 +2120,44 @@ fn convert_audio(
 
 #[cfg(test)]
 mod tests {
-    use super::format_quality;
+    use super::{
+        drain_seeks, format_quality, hold_gap_ms, scrub_speed, REPORTS_EVENT_KINDS,
+        HOLD_RELEASE_MS, HOLD_TAP_NO_RELEASE_MS, SCRUB_BASE_SPEED, SCRUB_MAX_SPEED,
+    };
     use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_FLAC, CODEC_TYPE_NULL, CODEC_TYPE_PCM_S16LE};
+
+    #[test]
+    fn tap_gap_widens_without_release_events() {
+        REPORTS_EVENT_KINDS.with(|c| c.set(false));
+        // No release events: the tap wait must outlast the key-repeat delay
+        assert_eq!(hold_gap_ms(false), HOLD_TAP_NO_RELEASE_MS);
+        assert!(HOLD_TAP_NO_RELEASE_MS > 660);
+        // Once scrubbing, or when releases are reported, the short gap applies
+        assert_eq!(hold_gap_ms(true), HOLD_RELEASE_MS);
+        REPORTS_EVENT_KINDS.with(|c| c.set(true));
+        assert_eq!(hold_gap_ms(false), HOLD_RELEASE_MS);
+        REPORTS_EVENT_KINDS.with(|c| c.set(false));
+    }
+
+    #[test]
+    fn scrub_speed_accelerates_then_caps() {
+        assert_eq!(scrub_speed(0.0), SCRUB_BASE_SPEED);
+        assert!(scrub_speed(1.0) > SCRUB_BASE_SPEED);
+        assert!(scrub_speed(1.0) < SCRUB_MAX_SPEED);
+        assert_eq!(scrub_speed(1_000.0), SCRUB_MAX_SPEED);
+        // Negative inputs (hold not yet past the tap threshold) clamp to base
+        assert_eq!(scrub_speed(-5.0), SCRUB_BASE_SPEED);
+    }
+
+    #[test]
+    fn drain_seeks_keeps_latest_and_empties() {
+        let (tx, rx) = std::sync::mpsc::channel::<f64>();
+        assert!(drain_seeks(&rx).is_none());
+        tx.send(10.0).unwrap();
+        tx.send(42.5).unwrap();
+        assert_eq!(drain_seeks(&rx), Some(42.5));
+        assert!(drain_seeks(&rx).is_none());
+    }
 
     #[test]
     fn flac_with_bit_depth_and_fractional_rate() {

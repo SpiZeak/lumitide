@@ -15,7 +15,7 @@ Stream audio from your Tidal account directly in the terminal, with album art, a
 
 ![Lumitide demo](assets/demo.gif)
 
-**Playback:** `→/n` next &nbsp;`←/p` prev &nbsp;`Space` pause &nbsp;`↑/+` vol up &nbsp;`↓/-` vol down &nbsp;`a` add/remove playlist · favorites &nbsp;`d` download &nbsp;`r` radio &nbsp;`?` controls &nbsp;`q/Esc` back
+**Playback:** `→/n` next &nbsp;`←/p` prev &nbsp;hold `←/→` seek &nbsp;`Space` pause &nbsp;`↑/+` vol up &nbsp;`↓/-` vol down &nbsp;`a` add/remove playlist · favorites &nbsp;`d` download &nbsp;`r` radio &nbsp;`?` controls &nbsp;`q/Esc` back
 
 **Lists:** `↑↓` / `jk` navigate &nbsp;`Enter` play &nbsp;`d` queue for download &nbsp;`Esc/q` back
 
@@ -173,6 +173,7 @@ lumitide config                        # open the config file in your editor
 |-----|--------|
 | `→` / `n` | Next track |
 | `←` / `p` | Previous track |
+| hold `→` / `←` | Seek forward / backward: playback pauses, the position scrubs (accelerating the longer you hold), and releasing jumps there — a short tap of `→`/`←` still skips tracks. Hold/release detection is instant on terminals that report key-release events (Windows Terminal, kitty, ghostty, wezterm, foot); elsewhere a tap registers after a short delay, so use `n`/`p` for rapid skipping |
 | `Space` | Pause / resume |
 | `↑` / `+` | Volume up |
 | `↓` / `-` | Volume down |

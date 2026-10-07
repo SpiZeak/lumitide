@@ -43,6 +43,8 @@ pub struct PanelState<'a> {
     pub total: f64,
     pub volume: f32,
     pub paused: bool,
+    /// While the user holds ←/→ to seek: +1 forward, -1 backward, None idle.
+    pub scrub_dir: Option<i8>,
     pub dl_status: &'a str,
     /// Transient status message (e.g. "✓ Added to favorites"); shown instead of dl_status.
     pub flash_msg: Option<&'a str>,
@@ -169,7 +171,13 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
 
     // Time + volume line
     let vol_pct = (state.volume * 100.0) as u32;
-    let pause_str = if state.paused { "  ⏸" } else { "" };
+    let pause_str = if let Some(dir) = state.scrub_dir {
+        if dir < 0 { "  ◀◀" } else { "  ▶▶" }
+    } else if state.paused {
+        "  ⏸"
+    } else {
+        ""
+    };
     let time_str = fmt_time(state.elapsed);
     let mut time_line: Vec<Span<'static>> = vec![
         Span::styled(time_str, Style::new().add_modifier(Modifier::BOLD)),
@@ -341,6 +349,7 @@ mod tests {
             total: 240.0,
             volume: 0.5,
             paused: false,
+            scrub_dir: None,
             dl_status: "",
             flash_msg: None,
             bar_color: None,
@@ -376,6 +385,28 @@ mod tests {
         let state = base_state();
         let without = rendered_text(&state);
         assert!(!without.contains("kHz"));
+    }
+
+    #[test]
+    fn scrub_indicator_shows_direction() {
+        let mut state = base_state();
+        state.scrub_dir = Some(-1);
+        let rewind = rendered_text(&state);
+        assert!(rewind.contains("◀◀"), "missing rewind indicator:\n{rewind}");
+
+        state.scrub_dir = Some(1);
+        let forward = rendered_text(&state);
+        assert!(forward.contains("▶▶"), "missing forward indicator:\n{forward}");
+    }
+
+    #[test]
+    fn scrub_replaces_pause_glyph() {
+        let mut state = base_state();
+        state.paused = true;
+        state.scrub_dir = Some(1);
+        let text = rendered_text(&state);
+        let time_line = text.lines().find(|l| l.contains("▶▶")).expect("scrub line");
+        assert!(!time_line.contains('⏸'), "pause glyph should hide while scrubbing:\n{time_line}");
     }
 
     #[test]
