@@ -43,7 +43,7 @@ pub struct PanelState<'a> {
     pub total: f64,
     pub volume: f32,
     pub paused: bool,
-    /// While the user holds ←/→ to seek: +1 forward, -1 backward, None idle.
+    /// While the user holds shift+←/→ to seek: +1 forward, -1 backward, None idle.
     pub scrub_dir: Option<i8>,
     pub dl_status: &'a str,
     /// Transient status message (e.g. "✓ Added to favorites"); shown instead of dl_status.
@@ -110,9 +110,9 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
         let area = Rect::new(x, y, block_w.min(terminal.width), block_h.min(terminal.height));
 
         let hint_text = if state.is_local {
-            "← prev  Spc pause  → next  ↑↓ vol  q/Esc quit"
+            "← prev  → next  ⇧←→ seek  Spc pause  ↑↓ vol  q/Esc quit"
         } else {
-            "← prev  Spc pause  → next  ↑↓ vol  a add  d download  r radio  q/Esc quit"
+            "← prev  → next  ⇧←→ seek  Spc pause  ↑↓ vol  a add  d download  r radio  q/Esc quit"
         };
         let outer = Block::default()
             .borders(Borders::ALL)
