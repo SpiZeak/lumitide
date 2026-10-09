@@ -61,6 +61,14 @@ const HOLD_RELEASE_MS: u64 = 300;
 /// exceed the system's initial key-repeat delay (typically 250–660 ms) so a
 /// held key isn't mistaken for a tap before its first auto-repeat arrives.
 const HOLD_TAP_NO_RELEASE_MS: u64 = 750;
+/// Longest gap between same-key events that still counts as one continuous
+/// hold on terminals without release events. Auto-repeat pulses every
+/// ~30–150 ms; a longer gap means the key was re-pressed — a new tap.
+const REPEAT_CONTINUATION_MS: u64 = 160;
+
+// A late press must resolve as a new tap before the hold could plausibly
+// escalate into a scrub
+const _: () = assert!(REPEAT_CONTINUATION_MS < HOLD_TAP_MS);
 /// Scrub speed as a multiple of real time: starts at SCRUB_BASE_SPEED when the
 /// hold becomes a seek, gains SCRUB_ACCEL per second held, capped at the max.
 const SCRUB_BASE_SPEED: f64 = 8.0;
@@ -75,6 +83,10 @@ thread_local! {
     /// protocol or Windows). Then "no release yet" reliably means "still
     /// held", allowing the short tap timeout and pre-repeat scrub entry.
     static REPORTS_EVENT_KINDS: Cell<bool> = const { Cell::new(false) };
+    /// A completed tap that still owes its skip: set when a late same-key
+    /// press proves the earlier presses were distinct taps — one skip breaks
+    /// out of play() and this one fires at the start of the next track.
+    static QUEUED_TAP: Cell<Option<i8>> = const { Cell::new(None) };
 }
 
 type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
@@ -905,6 +917,10 @@ struct KeyHold {
     scrubbing: bool,
     /// Set by an explicit key-release event where the terminal reports them.
     released: bool,
+    /// Set when a same-key event arrives too late to be an auto-repeat: it
+    /// might be a new tap or the first repeat of a slow-delay hold. If no
+    /// follow-up event arrives within REPEAT_CONTINUATION_MS it was a tap.
+    new_tap_at: Option<Instant>,
     target_secs: f64,
 }
 
@@ -922,6 +938,14 @@ fn hold_gap_ms(scrubbing: bool) -> u64 {
     } else {
         HOLD_TAP_NO_RELEASE_MS
     }
+}
+
+/// True when a same-key event still belongs to the current hold: while
+/// scrubbing any event continues it, terminals reporting event kinds mark
+/// repeats explicitly, and elsewhere only a gap within the continuation
+/// window does. A later same-key press is a fresh tap — not a longer hold.
+fn continues_hold(scrubbing: bool, reports_kinds: bool, gap_ms: u64) -> bool {
+    scrubbing || reports_kinds || gap_ms <= REPEAT_CONTINUATION_MS
 }
 
 /// Switch a held arrow key from tap-pending to scrubbing: pause playback and
@@ -1452,6 +1476,12 @@ fn play(
         terminal.draw(|f| panel::render(f, &panel_state))?;
 
         // ── Keyboard ─────────────────────────────────────────────────────────
+        // A tap resolved during the last transition still owes its skip —
+        // fire it first so rapid tapping skips one track per press
+        if let Some(dir) = QUEUED_TAP.with(Cell::take) {
+            stop_all.store(true, Ordering::Relaxed);
+            break (if dir > 0 { "next" } else { "prev" }).to_string();
+        }
         if event::poll(Duration::from_millis(90))? {
             if let Event::Key(key) = event::read()? {
                 // ←/→ drive hold-to-seek: a tap is still prev/next, holding
@@ -1474,16 +1504,33 @@ fn play(
                             let same = key_hold.as_ref().map_or(false, |h| h.dir == dir);
                             if same {
                                 let h = key_hold.as_mut().unwrap();
-                                h.last_event = now;
-                                h.released = false;
-                                if !h.scrubbing
-                                    && now.duration_since(h.pressed_at)
-                                        >= Duration::from_millis(HOLD_TAP_MS)
-                                {
-                                    begin_scrub(
-                                        h, now, elapsed_secs,
-                                        &mut was_paused_before_scrub, &paused,
-                                    );
+                                let gap = now.duration_since(h.last_event);
+                                if continues_hold(
+                                    h.scrubbing,
+                                    REPORTS_EVENT_KINDS.with(Cell::get),
+                                    gap.as_millis() as u64,
+                                ) {
+                                    h.new_tap_at = None;
+                                    h.last_event = now;
+                                    h.released = false;
+                                    if !h.scrubbing
+                                        && now.duration_since(h.pressed_at)
+                                            >= Duration::from_millis(HOLD_TAP_MS)
+                                    {
+                                        begin_scrub(
+                                            h, now, elapsed_secs,
+                                            &mut was_paused_before_scrub, &paused,
+                                        );
+                                    }
+                                } else {
+                                    // Too late to be an auto-repeat: this press
+                                    // starts its own tap. Don't scrub — if no
+                                    // follow-up event arrives within the
+                                    // continuation window, the hold-advance
+                                    // logic below resolves the presses before it
+                                    // as a completed tap and this one as the next
+                                    h.last_event = now;
+                                    h.new_tap_at = Some(now);
                                 }
                             } else {
                                 // Direction switch mid-hold: commit the old
@@ -1503,6 +1550,7 @@ fn play(
                                     last_tick: now,
                                     scrubbing: false,
                                     released: false,
+                                    new_tap_at: None,
                                     target_secs: elapsed_secs,
                                 });
                             }
@@ -1646,6 +1694,20 @@ fn play(
         }
 
         // ── Hold-to-seek: advance the scrub target, detect release ────────────
+        // A late press with no follow-up was a new tap, not a slow first
+        // repeat: the presses before it complete as a skip now, and the late
+        // press itself queues its skip for the start of the next track
+        if let Some(h) = key_hold.as_ref() {
+            if let Some(at) = h.new_tap_at {
+                if Instant::now().duration_since(at)
+                    >= Duration::from_millis(REPEAT_CONTINUATION_MS)
+                {
+                    QUEUED_TAP.with(|q| q.set(Some(h.dir)));
+                    stop_all.store(true, Ordering::Relaxed);
+                    break (if h.dir > 0 { "next" } else { "prev" }).to_string();
+                }
+            }
+        }
         if let Some(h) = key_hold.as_mut() {
             let now = Instant::now();
             // With release events reported, "no release yet" means the key is
@@ -2121,8 +2183,9 @@ fn convert_audio(
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_seeks, format_quality, hold_gap_ms, scrub_speed, REPORTS_EVENT_KINDS,
-        HOLD_RELEASE_MS, HOLD_TAP_NO_RELEASE_MS, SCRUB_BASE_SPEED, SCRUB_MAX_SPEED,
+        continues_hold, drain_seeks, format_quality, hold_gap_ms, scrub_speed,
+        REPORTS_EVENT_KINDS, HOLD_RELEASE_MS, HOLD_TAP_NO_RELEASE_MS,
+        REPEAT_CONTINUATION_MS, SCRUB_BASE_SPEED, SCRUB_MAX_SPEED,
     };
     use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_FLAC, CODEC_TYPE_NULL, CODEC_TYPE_PCM_S16LE};
 
@@ -2147,6 +2210,20 @@ mod tests {
         assert_eq!(scrub_speed(1_000.0), SCRUB_MAX_SPEED);
         // Negative inputs (hold not yet past the tap threshold) clamp to base
         assert_eq!(scrub_speed(-5.0), SCRUB_BASE_SPEED);
+    }
+
+    #[test]
+    fn rapid_taps_do_not_continue_hold_but_repeats_do() {
+        // Auto-repeat periods (30–150 ms) stay inside the continuation window
+        assert!(continues_hold(false, false, 30));
+        assert!(continues_hold(false, false, REPEAT_CONTINUATION_MS));
+        // Distinct taps are outside it and must never escalate into a scrub
+        assert!(!continues_hold(false, false, REPEAT_CONTINUATION_MS + 1));
+        assert!(!continues_hold(false, false, 700));
+        // With release events reported, repeats arrive marked as such
+        assert!(continues_hold(false, true, 10_000));
+        // A live scrub continues on any event; the short release gap ends it
+        assert!(continues_hold(true, false, 10_000));
     }
 
     #[test]

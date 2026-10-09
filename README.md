@@ -173,7 +173,7 @@ lumitide config                        # open the config file in your editor
 |-----|--------|
 | `→` / `n` | Next track |
 | `←` / `p` | Previous track |
-| hold `→` / `←` | Seek forward / backward: playback pauses, the position scrubs (accelerating the longer you hold), and releasing jumps there — a short tap of `→`/`←` still skips tracks. Hold/release detection is instant on terminals that report key-release events (Windows Terminal, kitty, ghostty, wezterm, foot); elsewhere a tap registers after a short delay, so use `n`/`p` for rapid skipping |
+| hold `→` / `←` | Seek forward / backward: playback pauses, the position scrubs (accelerating the longer you hold), and releasing jumps there — a short tap of `→`/`←` still skips tracks, and rapid tapping skips one track per press everywhere. Hold/release detection is instant on terminals that report key-release events (Windows Terminal, kitty, ghostty, wezterm, foot); elsewhere a single tap registers after a short delay, so use `n`/`p` for the fastest skipping |
 | `Space` | Pause / resume |
 | `↑` / `+` | Volume up |
 | `↓` / `-` | Volume down |
