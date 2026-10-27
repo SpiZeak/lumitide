@@ -21,7 +21,7 @@ use crate::api::{PlaylistInfo, TidalClient};
 use crate::config;
 use crate::preview;
 use crate::radio;
-use crate::utils::is_saved;
+use crate::utils::{ellipsize, is_saved};
 
 enum Action { Play(usize), Queue(usize), Create, Back }
 
@@ -153,7 +153,12 @@ pub fn run(client: &mut TidalClient, debug: bool) -> Result<()> {
                 loop {
                     let track = &tracks[play_idx];
                     let saved = is_saved(&cfg.output_path(), &track.artist_name, &track.title);
-                    let label = format!("{} / {}", play_idx + 1, tracks.len());
+                    let label = format!(
+                        "{}  {} / {}",
+                        ellipsize(&playlists[idx].title, 24),
+                        play_idx + 1,
+                        tracks.len()
+                    );
 
                     let result = preview::run(client, track.id, debug, Some(label), Some(volume.clone()), saved, direction)?;
 

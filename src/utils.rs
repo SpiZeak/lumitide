@@ -16,6 +16,19 @@ pub fn fmt_time(seconds: f64) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
+/// Truncate to at most `max` chars, ending with "…" when cut.
+pub fn ellipsize(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max - 1).collect();
+    out.push('…');
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,6 +51,24 @@ mod tests {
     #[test]
     fn fmt_time_over_one_minute() {
         assert_eq!(fmt_time(185.0), "3:05");
+    }
+
+    #[test]
+    fn ellipsize_short_string_unchanged() {
+        assert_eq!(ellipsize("Roadtrip", 24), "Roadtrip");
+    }
+
+    #[test]
+    fn ellipsize_exact_max_unchanged() {
+        let s = "a".repeat(24);
+        assert_eq!(ellipsize(&s, 24), s);
+    }
+
+    #[test]
+    fn ellipsize_truncates_long_string() {
+        let s = ellipsize("My super long playlist name", 10);
+        assert_eq!(s.chars().count(), 10);
+        assert!(s.ends_with('…'));
     }
 
     #[test]
