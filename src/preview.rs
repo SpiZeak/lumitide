@@ -81,9 +81,15 @@ type AppTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 fn setup_terminal() -> Result<AppTerminal> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
+    execute!(stdout, Clear(ClearType::All), EnterAlternateScreen)?;
     // Ask kitty-protocol terminals (kitty, ghostty, wezterm, foot, …) to report
     // key repeat/release events so a scrub ends the instant the key is lifted.
     // Ignored by terminals without support; Windows reports these natively.
+    // The push must happen after entering the alternate screen (and the pop in
+    // teardown_terminal before leaving it): the protocol keeps independent flag
+    // stacks per screen, so pushing on the main screen leaks the flags past
+    // teardown and later raw-input prompts receive stray release events
+    // (e.g. `CSI 117;1:3u`) they cannot parse.
     #[cfg(unix)]
     execute!(
         stdout,
@@ -91,7 +97,6 @@ fn setup_terminal() -> Result<AppTerminal> {
             event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES
         )
     )?;
-    execute!(stdout, Clear(ClearType::All), EnterAlternateScreen)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
@@ -744,11 +749,16 @@ fn playlist_membership(client: &TidalClient, playlists: &[PlaylistInfo], track_i
 }
 
 fn flash_msg(msg: String, flash: &mut Option<(String, Instant)>) {
-    // API errors carry long JSON bodies — keep the info line readable
-    let short: String = if msg.chars().count() > 60 {
-        let mut s: String = msg.chars().take(60).collect();
-        s.push('…');
-        s
+    // API errors carry long JSON bodies — keep the info line readable.
+    // Their human-readable part (userMessage) sits at the end, so for
+    // those keep the tail instead of the head.
+    let count = msg.chars().count();
+    let short: String = if count > 60 {
+        if msg.starts_with("API error") {
+            format!("…{}", msg.chars().skip(count - 60).collect::<String>())
+        } else {
+            format!("{}…", msg.chars().take(60).collect::<String>())
+        }
     } else {
         msg
     };
