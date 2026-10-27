@@ -289,22 +289,17 @@ impl TidalClient {
         self.send(reqwest::Method::GET, path, params, None, &[])
     }
 
-    fn post(
+    /// POST with a form-encoded body — Tidal's v1 write endpoints stopped
+    /// reading JSON bodies and now only accept request parameters (trackIds,
+    /// title, …) sent as form fields.
+    fn post_form(
         &mut self,
         path: &str,
         params: &[(&str, &str)],
-        json: Option<&serde_json::Value>,
+        form: &[(&str, &str)],
+        headers: &[(&str, &str)],
     ) -> Result<reqwest::blocking::Response> {
-        self.send(reqwest::Method::POST, path, params, json, &[])
-    }
-
-    fn put(
-        &mut self,
-        path: &str,
-        params: &[(&str, &str)],
-        json: Option<&serde_json::Value>,
-    ) -> Result<reqwest::blocking::Response> {
-        self.send(reqwest::Method::PUT, path, params, json, &[])
+        self.send(reqwest::Method::POST, path, params, Some(form), headers)
     }
 
     /// Send a request; on 401/403 refresh the session once and retry.
@@ -313,15 +308,15 @@ impl TidalClient {
         method: reqwest::Method,
         path: &str,
         params: &[(&str, &str)],
-        json: Option<&serde_json::Value>,
+        form: Option<&[(&str, &str)]>,
         headers: &[(&str, &str)],
     ) -> Result<reqwest::blocking::Response> {
-        let mut resp = self.send_once(&method, path, params, json, headers)?;
+        let mut resp = self.send_once(&method, path, params, form, headers)?;
         if resp.status().as_u16() == 401 || resp.status().as_u16() == 403 {
             if let Ok(new_session) = crate::auth::refresh_token(&self.session) {
                 let _ = crate::auth::save_session(&new_session);
                 self.session = new_session;
-                resp = self.send_once(&method, path, params, json, headers)?;
+                resp = self.send_once(&method, path, params, form, headers)?;
             }
         }
         if !resp.status().is_success() {
@@ -337,15 +332,15 @@ impl TidalClient {
         method: &reqwest::Method,
         path: &str,
         params: &[(&str, &str)],
-        json: Option<&serde_json::Value>,
+        form: Option<&[(&str, &str)]>,
         headers: &[(&str, &str)],
     ) -> Result<reqwest::blocking::Response> {
         let url = format!("{}/{}", API_BASE, path);
         let mut req = self.client.request(method.clone(), &url)
             .header("Authorization", self.session.auth_header())
             .query(&[("countryCode", self.session.country_code.as_str())]);
-        if let Some(body) = json {
-            req = req.json(body);
+        if let Some(fields) = form {
+            req = req.form(&fields.to_vec());
         }
         for &(k, v) in params {
             req = req.query(&[(k, v)]);
@@ -649,39 +644,58 @@ impl TidalClient {
             title: String,
         }
 
-        let body = serde_json::json!({ "title": title, "description": "" });
-        let resp = self.put(
+        // Form-encoded POST — the old PUT+JSON combination was retired
+        // (405/400) alongside Tidal's playlist-write migration.
+        let resp = self.post_form(
             &format!("users/{}/playlists", self.session.user_id),
             &[],
-            Some(&body),
+            &[("title", title), ("description", "")],
+            &[],
         )?;
         let pl: Resp = resp.json()?;
         Ok(PlaylistInfo { id: pl.uuid, title: pl.title })
     }
 
-    /// Add a track to the user's favorites (♥).
+    /// Add a track to the user's favorites (♥). Form-encoded like the other
+    /// write endpoints — query-parameter bodies now fail with 400.
     pub fn add_favorite_track(&mut self, track_id: u64) -> Result<()> {
         let track_s = track_id.to_string();
-        self.post(
+        self.post_form(
             &format!("users/{}/favorites/tracks", self.session.user_id),
-            &[
-                ("trackIds", track_s.as_str()),
-            ],
-            None,
+            &[],
+            &[("trackIds", track_s.as_str())],
+            &[],
         )?;
         Ok(())
     }
 
-    /// Add a track to one of the user's playlists.
-    /// Returns Ok(false) when the track was skipped as a duplicate.
-    pub fn add_track_to_playlist(&mut self, playlist_id: &str, track_id: u64) -> Result<bool> {
-        let body = serde_json::json!({ "trackIds": [track_id] });
-        let resp = self.post(
+    /// Current ETag of a playlist's item list. Item writes reject stale
+    /// state without it (412); the dedicated /playlists/{id}/etag endpoint
+    /// was retired, so the header on the items GET is the only source.
+    fn playlist_etag(&mut self, playlist_id: &str) -> Result<String> {
+        let resp = self.get(
             &format!("playlists/{}/items", playlist_id),
-            &[
-                ("onDupes", "SKIP"),
-            ],
-            Some(&body),
+            &[("limit", "100"), ("offset", "0")],
+        )?;
+        resp.headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow!("playlists/{}/items returned no ETag", playlist_id))
+    }
+
+    /// Add a track to one of the user's playlists.
+    /// Returns Ok(false) when the track was skipped as a duplicate — though
+    /// the API stopped returning `addedItemIds` (empty body on success), so
+    /// duplicates are now indistinguishable and reported as added.
+    pub fn add_track_to_playlist(&mut self, playlist_id: &str, track_id: u64) -> Result<bool> {
+        let track_s = track_id.to_string();
+        let etag = self.playlist_etag(playlist_id)?;
+        let resp = self.post_form(
+            &format!("playlists/{}/items", playlist_id),
+            &[("onDupes", "SKIP")],
+            &[("trackIds", track_s.as_str())],
+            &[("If-None-Match", etag.as_str())],
         )?;
         #[derive(Deserialize)]
         struct Resp {
@@ -765,27 +779,17 @@ impl TidalClient {
         }
 
         // The write rejects stale state without the current items ETag.
-        if etag.is_none() {
-            etag = self.get(&format!("playlists/{}/etag", playlist_id), &[])?
-                .headers()
-                .get(reqwest::header::ETAG)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned);
-        }
+        let etag = etag.ok_or_else(|| anyhow!("playlists/{}/items returned no ETag", playlist_id))?;
         let index_path = indexes.iter()
             .map(u64::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        let headers: &[(&str, &str)] = match etag.as_deref() {
-            Some(e) => &[("If-None-Match", e)],
-            None => &[],
-        };
         self.send(
             reqwest::Method::DELETE,
             &format!("playlists/{}/items/{}", playlist_id, index_path),
             &[],
             None,
-            headers,
+            &[("If-None-Match", etag.as_str())],
         )?;
         Ok(true)
     }
@@ -1310,5 +1314,78 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// End-to-end: create playlist → add track → verify membership → remove →
+    /// delete playlist. Pins the request shapes Tidal's v1 playlist writes
+    /// now require (form-encoded params + If-None-Match ETag) — the JSON-body
+    /// forms the endpoints used to accept all fail with 400/405/412.
+    /// Run with: cargo test e2e_playlist_write_cycle -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a real Tidal session on disk (~/.config/lumitide/session.json)"]
+    fn e2e_playlist_write_cycle() {
+        let session = crate::auth::get_session().expect("load session");
+        let mut client = TidalClient::new(session.clone());
+        let track_id = 568087226u64; // johala42 — Uroboros hardtekk
+
+        // 1. Create (form-encoded POST)
+        let pl = client.create_playlist("lumitide e2e test").expect("create_playlist");
+        println!("[1] created {} ({})", pl.title, pl.id);
+
+        // 2. Add (form-encoded trackIds + If-None-Match etag)
+        let added = client.add_track_to_playlist(&pl.id, track_id).expect("add_track_to_playlist");
+        assert!(added, "add reported not-added");
+        println!("[2] added track {}", track_id);
+
+        // 3. Membership
+        assert!(client.playlist_contains_track(&pl.id, track_id).expect("playlist_contains_track"));
+        println!("[3] membership confirmed");
+
+        // 4. Duplicate add with a fresh etag must not error (onDupes=SKIP)
+        client.add_track_to_playlist(&pl.id, track_id)
+            .unwrap_or_else(|e| panic!("duplicate add failed: {e}"));
+        println!("[4] duplicate add tolerated");
+
+        // 5. Remove every occurrence
+        let removed = client.remove_track_from_playlist(&pl.id, track_id).expect("remove_track_from_playlist");
+        assert!(removed, "remove reported nothing removed");
+        println!("[5] removed");
+
+        // 6. Playlist is empty again
+        assert!(!client.playlist_contains_track(&pl.id, track_id).expect("playlist_contains_track"));
+        println!("[6] membership gone");
+
+        // 7. Delete the scratch playlist
+        client.send(
+            reqwest::Method::DELETE,
+            &format!("playlists/{}", pl.id),
+            &[],
+            None,
+            &[],
+        ).expect("delete playlist");
+        println!("[7] scratch playlist deleted");
+
+        // 8. Favorites add (form-encoded) — verify via the nested items shape,
+        // then restore state via the path-param DELETE.
+        client.add_favorite_track(track_id).expect("add_favorite_track");
+        let favs: serde_json::Value = client.send(
+            reqwest::Method::GET,
+            &format!("users/{}/favorites/tracks", client.session.user_id),
+            &[("limit", "50")],
+            None,
+            &[],
+        ).expect("favorites GET").json().expect("favorites JSON");
+        let listed = favs["items"].as_array().is_some_and(|items| items.iter()
+            .any(|i| i["item"]["id"].as_u64() == Some(track_id)));
+        assert!(listed, "track not present in favorites after add");
+        println!("[8] favorite added and listed");
+        client.send(
+            reqwest::Method::DELETE,
+            &format!("users/{}/favorites/tracks/{}", client.session.user_id, track_id),
+            &[],
+            None,
+            &[],
+        ).expect("unfavorite");
+        println!("[9] favorite removed");
     }
 }
