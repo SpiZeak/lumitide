@@ -180,6 +180,7 @@ lumitide config                        # open the config file in your editor
 | `a` | Add current track to a playlist or favorites, or remove it from a playlist (picker overlay; playback continues). Playlists already containing the track are marked `✓` — selecting one removes it, others add it. The picker's `+ New playlist` entry creates a playlist and adds the track to it |
 | `d` | Download current track to disk |
 | `r` | Start radio from current track |
+| `s` | Copy the current track's Tidal link (`https://tidal.com/browse/track/<id>`) to the clipboard. Uses the OSC 52 escape sequence, so it works over SSH; needs a terminal that supports it (kitty, ghostty, wezterm, foot, Windows Terminal, …). Inside tmux, enable `set -g set-clipboard on` |
 | `?` | Toggle controls overlay |
 | `q` / `Esc` | Go back |
 

@@ -1590,6 +1590,20 @@ fn play(
                                     ));
                                 }
                             }
+                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                                let msg = if is_local {
+                                    "✗ Local file — no link to share"
+                                } else {
+                                    use std::io::Write;
+                                    let seq = osc52_copy(&track_share_url(track.id));
+                                    let out = terminal.backend_mut();
+                                    match out.write_all(seq.as_bytes()).and_then(|_| out.flush()) {
+                                        Ok(()) => "✓ Link copied",
+                                        Err(_) => "✗ Couldn't copy link",
+                                    }
+                                };
+                                flash = Some((msg.to_string(), Instant::now() + Duration::from_secs(2)));
+                            }
                             KeyCode::Char('d') | KeyCode::Char('D') => {
                                 if already_saved || is_local {
                                     *dl_flash_until.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + Duration::from_secs(2));
@@ -1824,6 +1838,19 @@ fn probe_audio(
         sr,
     );
     Ok((sr, ch, quality))
+}
+
+/// Public Tidal web link for a track.
+fn track_share_url(id: u64) -> String {
+    format!("https://tidal.com/browse/track/{id}")
+}
+
+/// OSC 52 "set clipboard" sequence. Supporting terminals (kitty, ghostty,
+/// wezterm, foot, Windows Terminal, …) copy the text to the system clipboard,
+/// over SSH too; others ignore it, and the terminal never reports back.
+fn osc52_copy(text: &str) -> String {
+    use base64::Engine;
+    format!("\x1b]52;c;{}\x07", base64::engine::general_purpose::STANDARD.encode(text))
 }
 
 /// Human-readable quality label for the now-playing UI, derived from the
@@ -2111,8 +2138,8 @@ fn convert_audio(
 #[cfg(test)]
 mod tests {
     use super::{
-        drain_seeks, format_quality, hold_gap_ms, scrub_speed, KeyHold,
-        REPORTS_EVENT_KINDS, HOLD_RELEASE_MS, HOLD_TAP_NO_RELEASE_MS,
+        drain_seeks, format_quality, hold_gap_ms, osc52_copy, scrub_speed, track_share_url,
+        KeyHold, REPORTS_EVENT_KINDS, HOLD_RELEASE_MS, HOLD_TAP_NO_RELEASE_MS,
         SCRUB_BASE_SPEED, SCRUB_MAX_SPEED,
     };
     use std::time::{Duration, Instant};
@@ -2197,6 +2224,17 @@ mod tests {
             format_quality(CODEC_TYPE_AAC, None, 44100),
             Some("AAC 44.1 kHz".to_string())
         );
+    }
+
+    #[test]
+    fn share_url_points_at_tidal_track_page() {
+        assert_eq!(track_share_url(77646168), "https://tidal.com/browse/track/77646168");
+    }
+
+    #[test]
+    fn osc52_wraps_base64_payload_for_clipboard() {
+        // "hi" → base64 "aGk="; `c` selects the clipboard, BEL terminates
+        assert_eq!(osc52_copy("hi"), "\x1b]52;c;aGk=\x07");
     }
 
     #[test]

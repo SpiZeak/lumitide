@@ -112,7 +112,7 @@ pub fn render(frame: &mut Frame, state: &PanelState) {
         let hint_text = if state.is_local {
             "← prev  → next  ⇧←→ seek  Spc pause  ↑↓ vol  q/Esc quit"
         } else {
-            "← prev  → next  ⇧←→ seek  Spc pause  ↑↓ vol  a add  d download  r radio  q/Esc quit"
+            "← prev  → next  ⇧←→ seek  Spc pause  ↑↓ vol  a add  d download  r radio  s share  q/Esc quit"
         };
         let outer = Block::default()
             .borders(Borders::ALL)
